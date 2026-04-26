@@ -1,0 +1,86 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_load.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="syscall_translate.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_VEH.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="jump.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_stack.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_trace.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_dynamic.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_thunk.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="mine.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_load.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="syscall_translate.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_VEH.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="jump.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_stack.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_trace.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_dynamic.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_thunk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="mine_jump.asm">
+      <Filter>Source Files</Filter>
+    </MASM>
+    <MASM Include="mine_ABI.asm">
+      <Filter>Source Files</Filter>
+    </MASM>
+  </ItemGroup>
+</Project>
