@@ -1,0 +1,31 @@
+# Build outputs
+x64/
+Debug/
+Release/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.lib
+*.ilk
+*.exp
+*.tlog
+*.log
+*.manifest
+
+# Visual Studio / IDE
+.vs/
+*.suo
+*.user
+*.userprefs
+*.cache
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# ELF test binaries & temp files
+*.elf
+*.so
+*.tmp
+*.bin
