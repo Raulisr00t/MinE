@@ -1,4 +1,5 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
 #include "mine_stack.h"
 
 #include <Windows.h>
@@ -94,18 +95,20 @@ uint64_t MineStackBuild(uint64_t stack_top,
 {
     sp = (uint8_t*)stack_top;
 
+    /* align to 8 */
     sp = (uint8_t*)((uintptr_t)sp & ~(uintptr_t)7);
 
+    /* count envp */
     int envc = 0;
     if (envp) while (envp[envc]) envc++;
 
+    /* push string data */
     uint64_t* env_ptrs = (uint64_t*)malloc(((size_t)envc + 1) * sizeof(uint64_t));
     for (int i = envc - 1; i >= 0; i--)
         env_ptrs[i] = push_str(envp[i]);
     env_ptrs[envc] = 0;
 
     uint64_t* arg_ptrs = (uint64_t*)malloc(((size_t)argc + 1) * sizeof(uint64_t));
-
     for (int i = argc - 1; i >= 0; i--)
         arg_ptrs[i] = push_str(argv[i]);
     arg_ptrs[argc] = 0;
@@ -114,8 +117,10 @@ uint64_t MineStackBuild(uint64_t stack_top,
     uint64_t random_addr = push_random();
     uint64_t execfn_addr = push_str(argv[0]);
 
+    /* align to 16 before structured data */
     sp = (uint8_t*)((uintptr_t)sp & ~(uintptr_t)15);
 
+    /* auxv — AT_NULL last in memory means first pushed */
     push_auxv(AT_NULL, 0);
     push_auxv(AT_EXECFN, execfn_addr);
     push_auxv(AT_RANDOM, random_addr);
@@ -136,23 +141,32 @@ uint64_t MineStackBuild(uint64_t stack_top,
     push_auxv(AT_PHENT, (img->bits == 64) ? 56 : 32);
     push_auxv(AT_PHDR, img->phdr_va);
 
+    /* envp[] */
     push_u64(0);
     for (int i = envc - 1; i >= 0; i--)
         push_u64(env_ptrs[i]);
 
+    /* argv[] */
     push_u64(0);
     for (int i = argc - 1; i >= 0; i--)
         push_u64(arg_ptrs[i]);
 
+    /* argc */
     push_u64((uint64_t)argc);
 
     free(arg_ptrs);
     free(env_ptrs);
 
+    /*
+     * Linux ABI: at _start, (RSP % 16) == 0.
+     * argc is 8 bytes, so after pushing it RSP is 8-byte aligned.
+     * We need RSP % 16 == 0, so if it's only 8-aligned, subtract 8.
+     */
     uint64_t rsp = (uint64_t)sp;
-    if (rsp & 8) rsp -= 8;   
+    if (rsp & 8) rsp -= 8;   /* ensure 16-byte alignment */
 
     printf("[MinE] Stack RSP=0x%llX  argc=%d  envc=%d\n",
         (unsigned long long)rsp, argc, envc);
+ 
     return rsp;
 }

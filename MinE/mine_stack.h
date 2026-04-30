@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <bcrypt.h>
+#include <wincrypt.h>
+#include <ntstatus.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif

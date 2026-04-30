@@ -45,6 +45,9 @@
     <ClCompile Include="mine_thunk.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="mine_TLS.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="mine.h">
@@ -72,6 +75,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="mine_thunk.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_TLS.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

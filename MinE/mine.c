@@ -6,6 +6,7 @@
 #include "mine_VEH.h"
 #include "mine_trace.h"
 #include "mine_dynamic.h"
+#include "mine_tls.h"
 #include "jump.h"
 
 #include <Windows.h>
@@ -13,8 +14,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
-
-/* ─── ELF identity ────────────────────────────────────────────────────────── */
 
 #define EI_MAG0     0
 #define EI_MAG1     1
@@ -65,8 +64,6 @@ typedef struct {
 } ElfInfo;
 
 static ElfInfo g_elf;
-
-/* ─── helpers ─────────────────────────────────────────────────────────────── */
 
 static bool read_bytes(LPCSTR path, void* buf, DWORD n)
 {
@@ -175,7 +172,9 @@ bool CheckApp(LPCSTR path)
  * MineRun — full pipeline
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void MineRun(LPCSTR path)
+ /* Replace the MineRun function signature and stack build section with this: */
+
+void MineRun(LPCSTR path, int argc, const char* argv[])
 {
     /* ── init tracer (checks MINE_TRACE env var) ── */
     MineTraceInit();
@@ -196,26 +195,39 @@ void MineRun(LPCSTR path)
         return;
     }
 
-    /* ── 2. Apply GOT/PLT relocations (dynamic linking) ── */
+    /* ── 2. Set up TLS / FS base (must be before DynLink calls DT_INIT) ── */
+    MineTLSInit();
+
+    /* ── 3. Apply GOT/PLT relocations (dynamic linking) ── */
     if (!MineDynLink(path, &img)) {
         fprintf(stderr, "[MinE-Error] Dynamic link failed\n");
         return;
     }
 
-    /* ── 3. Install VEH syscall trap ── */
+    /* ── 4. Install VEH syscall trap ── */
     if (!MineVEHInstall()) return;
 
-    /* ── 4. Allocate guest stack ── */
+    /* ── 5. Allocate guest stack ── */
     MineStack stk;
     if (!MineStackAlloc(&stk)) {
         MineVEHRemove();
         return;
     }
 
-    /* ── 5. Build initial stack layout ── */
+    /* ── 6. Build initial stack layout ──
+     *
+     * argv[0] = MinE.exe  (host launcher, skip)
+     * argv[1] = ELF path  -> guest argv[0]
+     * argv[2..] = extra   -> guest argv[1..]
+     *
+     * guest_argc = argc - 1  (drop the host launcher name)
+     * guest_argv = &argv[1]
+     */
     extern char** environ;
-    const char* argv[] = { path, NULL };
-    uint64_t rsp = MineStackBuild(stk.stack_top, 1, argv,
+    int          guest_argc = argc - 1;
+    const char** guest_argv = argv + 1;
+
+    uint64_t rsp = MineStackBuild(stk.stack_top, guest_argc, guest_argv,
         (const char**)environ, &img);
 
     if (!rsp) {
@@ -227,11 +239,12 @@ void MineRun(LPCSTR path)
     printf("[MinE] Entry : 0x%llX   RSP : 0x%llX\n",
         (unsigned long long)img.entry,
         (unsigned long long)rsp);
-    
     printf("[MinE] Executing \n");
+
     fflush(stdout);
+ 
     fflush(stderr);
 
-    /* ── 6. Jump — does not return ── */
-    MineJump(img.entry, rsp);
+    /* ── 7. Jump — does not return ── */
+    MineJump(img.entry, rsp, MineTLSBase());
 }

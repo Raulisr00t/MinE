@@ -135,6 +135,7 @@
     <ClCompile Include="mine_load.c" />
     <ClCompile Include="mine_stack.c" />
     <ClCompile Include="mine_thunk.cpp" />
+    <ClCompile Include="mine_TLS.c" />
     <ClCompile Include="mine_trace.c" />
     <ClCompile Include="mine_VEH.cpp" />
     <ClCompile Include="syscall_translate.c" />
@@ -146,14 +147,18 @@
     <ClInclude Include="mine_load.h" />
     <ClInclude Include="mine_stack.h" />
     <ClInclude Include="mine_thunk.h" />
+    <ClInclude Include="mine_TLS.h" />
     <ClInclude Include="mine_trace.h" />
     <ClInclude Include="mine_VEH.h" />
     <ClInclude Include="syscall_translate.h" />
   </ItemGroup>
   <ItemGroup>
-    <MASM Include="mine_ABI.asm" />
+    <MASM Include="mine_ABI.asm">
+      <FileType>Document</FileType>
+    </MASM>
     <MASM Include="mine_jump.asm">
       <FileType>Document</FileType>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
     </MASM>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

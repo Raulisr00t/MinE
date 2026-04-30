@@ -82,7 +82,7 @@ static DWORD elf_prot(uint32_t f)
 
 static bool fread_at(HANDLE fh, uint64_t off, void* buf, DWORD n)
 {
-    LARGE_INTEGER li; li.QuadPart = (LONGLONG)off;
+    LARGE_INTEGER li; memset(&li, 0, sizeof(li)); li.QuadPart = (LONGLONG)off;
     if (!SetFilePointerEx(fh, li, NULL, FILE_BEGIN)) return false;
     DWORD got = 0;
     return ReadFile(fh, buf, n, &got, NULL) && got == n;
@@ -108,9 +108,13 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
     /* ── read ELF header ── */
     uint8_t hbuf[64] = { 0 };
     DWORD   got = 0;
-    ReadFile(fh, hbuf, sizeof(hbuf), &got, NULL);
+    if (!ReadFile(fh, hbuf, sizeof(hbuf), &got, NULL) || got < 16) {
+        fprintf(stderr, "[MinE-Error] Failed to read ELF header\n");
+        CloseHandle(fh);
+        return false;
+    }
 
-    uint16_t e_type; uint64_t e_entry, e_phoff; uint16_t e_phnum, e_phentsize;
+    uint16_t e_type = 0; uint64_t e_entry = 0, e_phoff = 0; uint16_t e_phnum = 0, e_phentsize = 0;
 
     if (bits == 64) {
         Elf64_Ehdr* h = (Elf64_Ehdr*)hbuf;
@@ -263,7 +267,9 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
     out->base = (uint64_t)base_region;
     out->load_bias = load_bias;
     out->entry = e_entry + load_bias;
-
+    /* phdr_va: program headers are inside the first PT_LOAD segment.
+     * The ELF spec says PT_PHDR gives the VA; if absent, use phoff
+     * adjusted by the load bias (correct for PIE, 0 for ET_EXEC). */
     out->phdr_va = e_phoff + load_bias;
     out->phnum = e_phnum;
 

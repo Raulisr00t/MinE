@@ -1,17 +1,3 @@
-/*
- * mine_thunk.h
- *
- * Every function we give to the guest must be called with Linux x86-64 ABI
- * (args in RDI, RSI, RDX, RCX, R8, R9) but our stubs are Windows __cdecl
- * (args in RCX, RDX, R8, R9).
- *
- * MineLinuxToWin (in mine_abi.asm) fixes this:
- *   set RAX = Windows fn ptr, then call MineLinuxToWin
- *
- * MAKE_THUNK generates a naked per-symbol wrapper:
- *   <name>_thunk:  mov rax, <win_fn>  ;  jmp MineLinuxToWin
- */
-
 #ifndef MINE_THUNK_H
 #define MINE_THUNK_H
 
@@ -21,32 +7,36 @@
 extern "C" {
 #endif
 
-    /* defined in mine_abi.asm */
-    void MineLinuxToWin(void);
+	/*
+	 * Defined in mine_ABI.asm
+	 *
+	 * MineLinuxToWinFS  — primary ABI bridge (USE THIS ONE)
+	 *   Called from thunk with RAX = Windows fn ptr.
+	 *   Saves guest FS (rdfsbase), maps 6 Linux args -> Windows ABI,
+	 *   calls fn, restores guest FS (wrfsbase), returns.
+	 *
+	 * MineLinuxToWin  — legacy (no FS save/restore)
+	 *
+	 * MineWinToLinux  — call Linux-ABI fn from Windows code
+	 *   Windows: RCX=fn, RDX=a1, R8=a2, R9=a3
+	 *
+	 * MineJump  — jump to guest entry with clean regs
+	 *   RCX = entry VA, RDX = guest RSP
+	 */
+	void MineLinuxToWinFS(void);
+	void MineLinuxToWin(void);
+	void MineWinToLinux(void);
+	void MineJump(void);
 
-    /*
-     * A thunk is a small heap-allocated code blob:
-     *   48 B8 <imm64>   mov rax, <win_fn>
-     *   FF E0           jmp rax  (to MineLinuxToWin... wait, we need a call not jmp)
-     *
-     * Actually simpler: since we control the stub, make a trampoline per function
-     * that does the arg shuffle inline. We generate them dynamically.
-     *
-     * Thunk layout (14 bytes):
-     *   48 B8 xx xx xx xx xx xx xx xx   mov rax, <win_fn_ptr>   (10 bytes)
-     *   E9 xx xx xx xx                  jmp MineLinuxToWin      (5 bytes)
-     *   -- total: 15 bytes, pad to 16
-     */
+	/* Allocate thunk pool near MineLinuxToWinFS. Call once at startup. */
+	void  MineThunkInit(void);
 
-    typedef struct {
-        uint8_t code[16];
-    } MineThunk;
-
-    /* Allocate executable memory for thunks and generate one per stub */
-    void  MineThunkInit(void);
-
-    /* Given a Windows function pointer, return a Linux-ABI-compatible thunk ptr */
-    void* MineThunkFor(void* win_fn);
+	/*
+	 * Return a Linux-ABI-callable thunk for the given Windows function.
+	 * The thunk saves/restores FS around the Windows call.
+	 * Returns win_fn unchanged if pool is exhausted (fallback, wrong ABI).
+	 */
+	void* MineThunkFor(void* win_fn);
 
 #ifdef __cplusplus
 }
