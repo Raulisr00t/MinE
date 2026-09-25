@@ -10,24 +10,22 @@ extern "C" {
 	/*
 	 * Defined in mine_ABI.asm
 	 *
-	 * MineLinuxToWinFS  — primary ABI bridge (USE THIS ONE)
+	 * MineLinuxToWinFS  ï¿½ primary ABI bridge (USE THIS ONE)
 	 *   Called from thunk with RAX = Windows fn ptr.
 	 *   Saves guest FS (rdfsbase), maps 6 Linux args -> Windows ABI,
 	 *   calls fn, restores guest FS (wrfsbase), returns.
 	 *
-	 * MineLinuxToWin  — legacy (no FS save/restore)
+	 * MineLinuxToWin  ï¿½ legacy (no FS save/restore)
 	 *
-	 * MineWinToLinux  — call Linux-ABI fn from Windows code
+	 * MineWinToLinux  ï¿½ call Linux-ABI fn from Windows code
 	 *   Windows: RCX=fn, RDX=a1, R8=a2, R9=a3
 	 *
-	 * MineJump  — jump to guest entry with clean regs
+	 * MineJump  ï¿½ jump to guest entry with clean regs
 	 *   RCX = entry VA, RDX = guest RSP
 	 */
 	void MineLinuxToWinFS(void);
 	void MineLinuxToWin(void);
 	void MineWinToLinux(void);
-	void MineJump(void);
-
 	/* Allocate thunk pool near MineLinuxToWinFS. Call once at startup. */
 	void  MineThunkInit(void);
 

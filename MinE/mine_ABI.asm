@@ -11,10 +11,10 @@ PUBLIC MineJump
 ; Entry: RAX=win_fn, RDI=a1, RSI=a2, RDX=a3, RCX=a4, R8=a5, R9=a6
 ; Saves guest FS via rdfsbase, maps Linux->Win ABI, calls fn, restores FS.
 ; Stack at entry: [RSP] = return address (8 bytes from caller's call instruction)
-; Pushes: rbp rbx r12 r13 r14 r15 = 6x8 = 48 bytes. Total RSP shift = 56.
-; sub 40h = 64 bytes more. Grand total = 120 bytes.
+; Pushes: rbp rbx r12 r13 r14 r15 = 6x8 = 48 bytes.
+; sub 48h = 72 bytes more. Grand total push+sub = 120 bytes.
 ; Entry RSP%16 = 8 (Linux caller had 16-aligned RSP before call).
-; After 6 pushes: (8 - 48)%16 = 8. After sub 40h: (8 - 64)%16 = 8. Correct.
+; After 6 pushes: (8 - 48)%16 = 8. After sub 48h: (8 - 120)%16 = 0. Correct for Win call.
 MineLinuxToWinFS PROC
     push    rbp
     mov     rbp, rsp
@@ -27,7 +27,7 @@ MineLinuxToWinFS PROC
     mov     r13, r8
     mov     r14, r9
     rdfsbase rbx
-    sub     rsp, 40h
+    sub     rsp, 48h
     mov     QWORD PTR [rsp+20h], r13
     mov     QWORD PTR [rsp+28h], r14
     mov     r8,  rdx
@@ -36,7 +36,7 @@ MineLinuxToWinFS PROC
     mov     rdx, rsi
     call    r12
     wrfsbase rbx
-    add     rsp, 40h
+    add     rsp, 48h
     pop     r15
     pop     r14
     pop     r13

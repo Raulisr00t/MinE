@@ -113,12 +113,22 @@ uint64_t MineStackBuild(uint64_t stack_top,
         arg_ptrs[i] = push_str(argv[i]);
     arg_ptrs[argc] = 0;
 
+    /* Convert backslashes to forward slashes in argv[0] for Linux binaries */
+    for (char* p = (char*)(uintptr_t)arg_ptrs[0]; *p; p++)
+        if (*p == '\\') *p = '/';
+
     uint64_t platform_addr = push_str("x86_64");
     uint64_t random_addr = push_random();
     uint64_t execfn_addr = push_str(argv[0]);
+    for (char* p = (char*)(uintptr_t)execfn_addr; *p; p++)
+        if (*p == '\\') *p = '/';
 
     /* align to 16 before structured data */
     sp = (uint8_t*)((uintptr_t)sp & ~(uintptr_t)15);
+
+    /* Pre-pad: 19 auxv pairs (38) + envp NULL (1) + envc + argv NULL (1) + argc + argc (1) = 41 + argc + envc.
+       If odd, push one padding u64 here (above AT_NULL in memory, invisible to auxv scanner). */
+    if ((argc + envc + 41) & 1) push_u64(0);
 
     /* auxv — AT_NULL last in memory means first pushed */
     push_auxv(AT_NULL, 0);
@@ -157,13 +167,7 @@ uint64_t MineStackBuild(uint64_t stack_top,
     free(arg_ptrs);
     free(env_ptrs);
 
-    /*
-     * Linux ABI: at _start, (RSP % 16) == 0.
-     * argc is 8 bytes, so after pushing it RSP is 8-byte aligned.
-     * We need RSP % 16 == 0, so if it's only 8-aligned, subtract 8.
-     */
     uint64_t rsp = (uint64_t)sp;
-    if (rsp & 8) rsp -= 8;   /* ensure 16-byte alignment */
 
     printf("[MinE] Stack RSP=0x%llX  argc=%d  envc=%d\n",
         (unsigned long long)rsp, argc, envc);

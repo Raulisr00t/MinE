@@ -2,11 +2,13 @@
 
 #include "mine.h"
 #include "mine_load.h"
+#include "mine_patch.h"
 #include "mine_stack.h"
 #include "mine_VEH.h"
 #include "mine_trace.h"
 #include "mine_dynamic.h"
 #include "mine_tls.h"
+#include "mine_vfs.h"
 #include "jump.h"
 
 #include <Windows.h>
@@ -23,7 +25,7 @@
 #define EI_DATA     5
 #define EI_VERSION  6
 
-#define ELFMAG0     0x7Fu
+#define ELFMAG0     0x7F
 #define ELFMAG1     'E'
 #define ELFMAG2     'L'
 #define ELFMAG3     'F'
@@ -176,7 +178,8 @@ bool CheckApp(LPCSTR path)
 
 void MineRun(LPCSTR path, int argc, const char* argv[])
 {
-    /* ── init tracer (checks MINE_TRACE env var) ── */
+    /* ── init VFS + tracer ── */
+    MineVFSInit(path);
     MineTraceInit();
 
     printf("[MinE] Starting '%s'\n", path);
@@ -194,6 +197,9 @@ void MineRun(LPCSTR path, int argc, const char* argv[])
         fprintf(stderr, "[MinE-Error] Load failed\n");
         return;
     }
+
+    /* ── 1b. Patch syscall (0F 05) -> ud2 (0F 0B) in executable segments ── */
+    MinePatchSyscalls(&img);
 
     /* ── 2. Set up TLS / FS base (must be before DynLink calls DT_INIT) ── */
     MineTLSInit();

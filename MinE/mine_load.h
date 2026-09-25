@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+#define MINE_MAX_EXEC_SEGS 16
+
     typedef struct {
         uint64_t base;
         uint64_t load_bias;
@@ -16,6 +18,12 @@ extern "C" {
         uint64_t phdr_va;
         uint16_t phnum;
         uint8_t  bits;
+        char     interp[256];
+        struct {
+            uint64_t va;
+            uint64_t size;
+        } exec_segs[MINE_MAX_EXEC_SEGS];
+        int exec_seg_count;
     } MineImage;
 
     bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out);

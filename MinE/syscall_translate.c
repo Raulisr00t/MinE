@@ -11,6 +11,7 @@
 #include "syscall_translate.h"
 #include "mine_dynamic.h"
 #include "mine_trace.h"
+#include "mine_vfs.h"
 #include <io.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -39,6 +40,8 @@
 #define SYS_rt_sigprocmask    14
 #define SYS_rt_sigreturn      15
 #define SYS_ioctl             16
+#define SYS_pread64           17
+#define SYS_pwrite64          18
 #define SYS_writev            20
 #define SYS_access            21
 #define SYS_pipe              22
@@ -46,6 +49,7 @@
 #define SYS_sched_yield       24
 #define SYS_msync             26
 #define SYS_mincore           27
+#define SYS_mremap            25
 #define SYS_madvise           28
 #define SYS_dup               32
 #define SYS_dup2              33
@@ -109,11 +113,14 @@
 #define SYS_clock_getres      229
 #define SYS_exit_group        231
 #define SYS_openat            257
+#define SYS_newfstatat        262
+#define SYS_readlinkat        267
 #define SYS_set_robust_list   273
 #define SYS_get_robust_list   274
 #define SYS_pipe2             293
 #define SYS_prlimit64         302
 #define SYS_getrandom         318
+#define SYS_rseq              334
 #define SYS_capget            125
 #define SYS_capset            126
 #define SYS_rt_sigsuspend     130
@@ -121,7 +128,11 @@
 #define SYS_munlock           150
 #define SYS_mlockall          151
 #define SYS_munlockall        152
+#define SYS_clock_nanosleep   230
+#define SYS_tgkill            234
 #define SYS_settimeofday      164
+#define SYS_tkill             200
+#define SYS_time              201
 
 /* ─── Linux errno ─────────────────────────────────────────────────────────── */
 #define LINUX_EPERM      1
@@ -253,6 +264,16 @@ static DWORD linux_prot_to_win(uint32_t p)
     return PAGE_NOACCESS;
 }
 
+/* ─── Directory state for getdents64 ─────────────────────────────────────── */
+#define MAX_DIR_HANDLES 32
+typedef struct {
+    int fd;
+    HANDLE hFind;
+    bool started;
+    bool finished;
+} DirState;
+static DirState g_dirs[MAX_DIR_HANDLES];
+
 /* ─── File helpers ────────────────────────────────────────────────────────── */
 static uint64_t filetime_to_unix(FILETIME ft)
 {
@@ -274,6 +295,7 @@ static HANDLE fd_to_handle(int fd)
 /* ─── I/O ─────────────────────────────────────────────────────────────────── */
 static int64_t sys_read(int fd, void* buf, uint64_t count)
 {
+    if (MineVFSIsVFD(fd)) return MineVFSRead(fd, buf, count);
     HANDLE h = fd_to_handle(fd); if (!h) return -(int64_t)LINUX_EBADF;
     DWORD got = 0; if (!ReadFile(h, buf, (DWORD)count, &got, NULL)) return -(int64_t)LINUX_EIO;
     return (int64_t)got;
@@ -281,6 +303,7 @@ static int64_t sys_read(int fd, void* buf, uint64_t count)
 
 static int64_t sys_write(int fd, const void* buf, uint64_t count)
 {
+    if (MineVFSIsVFD(fd)) return MineVFSWrite(fd, buf, count);
     HANDLE h = fd_to_handle(fd); if (!h) return -(int64_t)LINUX_EBADF;
     DWORD w = 0; if (!WriteFile(h, buf, (DWORD)count, &w, NULL)) return -(int64_t)LINUX_EIO;
     return (int64_t)w;
@@ -297,26 +320,89 @@ static int64_t sys_writev(int fd, const Linux_iovec* iov, int iovcnt)
     return total;
 }
 
-static int64_t sys_open_internal(const char* path, int flags, int mode)
+static int64_t sys_pread64(int fd, void* buf, uint64_t count, uint64_t offset)
+{
+    HANDLE h = fd_to_handle(fd); if (!h) return -(int64_t)LINUX_EBADF;
+    OVERLAPPED ov; memset(&ov, 0, sizeof(ov));
+    ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)(offset >> 32);
+    DWORD got = 0;
+    if (!ReadFile(h, buf, (DWORD)count, &got, &ov)) {
+        if (GetLastError() == ERROR_HANDLE_EOF) return 0;
+        return -(int64_t)LINUX_EIO;
+    }
+    return (int64_t)got;
+}
+
+static int64_t sys_pwrite64(int fd, const void* buf, uint64_t count, uint64_t offset)
+{
+    HANDLE h = fd_to_handle(fd); if (!h) return -(int64_t)LINUX_EBADF;
+    OVERLAPPED ov; memset(&ov, 0, sizeof(ov));
+    ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)(offset >> 32);
+    DWORD wrote = 0;
+    if (!WriteFile(h, buf, (DWORD)count, &wrote, &ov)) return -(int64_t)LINUX_EIO;
+    return (int64_t)wrote;
+}
+
+static int64_t sys_open_real(const char* win_path, int flags, int mode)
 {
     (void)mode;
     DWORD access = GENERIC_READ, create = OPEN_EXISTING;
     if ((flags & 3) == 1) access = GENERIC_WRITE;
     if ((flags & 3) == 2) access = GENERIC_READ | GENERIC_WRITE;
-    if (flags & 0x40)  create = OPEN_ALWAYS;
-    if (flags & 0x200) create = CREATE_ALWAYS;
-    if (flags & 0x800) create = TRUNCATE_EXISTING;
-    HANDLE h = CreateFileA(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, create, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (flags & 0x40)
+        create = (flags & 0x200) ? CREATE_ALWAYS : OPEN_ALWAYS;
+    else if (flags & 0x200)
+        create = TRUNCATE_EXISTING;
+    DWORD dwattr = GetFileAttributesA(win_path);
+    DWORD extra = (dwattr != INVALID_FILE_ATTRIBUTES && (dwattr & FILE_ATTRIBUTE_DIRECTORY))
+        ? FILE_FLAG_BACKUP_SEMANTICS : 0;
+    HANDLE h = CreateFileA(win_path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, create, FILE_ATTRIBUTE_NORMAL | extra, NULL);
     if (h == INVALID_HANDLE_VALUE) return winerr();
+    if (flags & 0x400) {
+        LARGE_INTEGER li; li.QuadPart = 0;
+        SetFilePointerEx(h, li, NULL, FILE_END);
+    }
     int fd = _open_osfhandle((intptr_t)h, 0);
     if (fd < 0) { CloseHandle(h); return -(int64_t)LINUX_EIO; }
     return fd;
 }
 
+static int64_t sys_open_internal(const char* path, int flags, int mode)
+{
+    int virt_type = VFS_REAL;
+    const char* win_path = MineVFSTranslate(path, &virt_type);
+
+    if (virt_type != VFS_REAL) {
+        if (virt_type == VFS_UNKNOWN) return -(int64_t)LINUX_ENOENT;
+        int vfd = MineVFSOpen(virt_type, flags);
+        return vfd >= 0 ? (int64_t)vfd : -(int64_t)LINUX_ENOENT;
+    }
+
+    return sys_open_real(win_path ? win_path : path, flags, mode);
+}
+
 static int64_t sys_open(const char* path, int flags, int mode) { return sys_open_internal(path, flags, mode); }
-static int64_t sys_openat(int d, const char* path, int flags, int mode) { (void)d; return sys_open_internal(path, flags, mode); }
-static int64_t sys_close(int fd) { if (fd <= 2) return 0; return _close(fd) == 0 ? 0 : -(int64_t)LINUX_EBADF; }
+static int64_t sys_openat(int d, const char* path, int flags, int mode)
+{
+    /* AT_FDCWD = -100 or absolute path -> use as-is */
+    (void)d;
+    return sys_open_internal(path, flags, mode);
+}
+static int64_t sys_close(int fd) {
+    if (fd < 0) return -(int64_t)LINUX_EBADF;
+    if (fd <= 2) return 0;
+    if (MineVFSIsVFD(fd)) return MineVFSClose(fd) == 0 ? 0 : -(int64_t)LINUX_EBADF;
+    for (int i = 0; i < MAX_DIR_HANDLES; i++) {
+        if (g_dirs[i].fd == fd && g_dirs[i].started) {
+            if (g_dirs[i].hFind != INVALID_HANDLE_VALUE) FindClose(g_dirs[i].hFind);
+            g_dirs[i].started = false;
+        }
+    }
+    return _close(fd) == 0 ? 0 : -(int64_t)LINUX_EBADF;
+}
 
 static void fill_stat(Linux_stat* st, DWORD attr, uint64_t size)
 {
@@ -333,6 +419,7 @@ static void fill_stat(Linux_stat* st, DWORD attr, uint64_t size)
 
 static int64_t sys_fstat(int fd, Linux_stat* st)
 {
+    if (MineVFSIsVFD(fd)) return MineVFSFstat(fd, st);
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE || !h) {
         memset(st, 0, sizeof(*st)); st->st_mode = 0020666; st->st_nlink = 1; st->st_blksize = 4096;
@@ -348,8 +435,24 @@ static int64_t sys_fstat(int fd, Linux_stat* st)
 
 static int64_t sys_stat(const char* path, Linux_stat* st)
 {
+    int virt_type = VFS_REAL;
+    const char* win_path = MineVFSTranslate(path, &virt_type);
+
+    if (virt_type != VFS_REAL) {
+        if (virt_type == VFS_UNKNOWN) return -(int64_t)LINUX_ENOENT;
+        /* Virtual files always "exist" */
+        memset(st, 0, sizeof(*st));
+        st->st_nlink = 1; st->st_blksize = 4096;
+        if (virt_type <= VFS_DEV_STDERR || virt_type == VFS_DEV_TTY)
+            st->st_mode = 0020666;
+        else
+            st->st_mode = 0100444;
+        return 0;
+    }
+
+    const char* p = win_path ? win_path : path;
     WIN32_FILE_ATTRIBUTE_DATA fa; memset(&fa, 0, sizeof(fa));
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return winerr();
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return winerr();
     ULARGE_INTEGER sz = { 0 }; sz.LowPart = fa.nFileSizeLow; sz.HighPart = fa.nFileSizeHigh;
     fill_stat(st, fa.dwFileAttributes, sz.QuadPart); return 0;
 }
@@ -361,15 +464,28 @@ static int64_t sys_lseek(int fd, int64_t off, int whence)
 
 static int64_t sys_access(const char* path, int mode)
 {
-    (void)mode; return GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES ? -(int64_t)LINUX_ENOENT : 0;
+    (void)mode;
+    int virt_type = VFS_REAL;
+    const char* win_path = MineVFSTranslate(path, &virt_type);
+    if (virt_type != VFS_REAL)
+        return (virt_type == VFS_UNKNOWN) ? -(int64_t)LINUX_ENOENT : 0;
+    const char* p = win_path ? win_path : path;
+    return GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES ? -(int64_t)LINUX_ENOENT : 0;
 }
 
 static int64_t sys_getcwd(char* buf, uint64_t size)
 {
     char tmp[4096]; if (!GetCurrentDirectoryA(sizeof(tmp), tmp)) return winerr();
     for (char* p = tmp; *p; p++) if (*p == '\\') *p = '/';
-    size_t len = strlen(tmp); if (len + 1 > size) return -(int64_t)LINUX_EINVAL;
-    memcpy(buf, tmp, len + 1); return (int64_t)(uintptr_t)buf;
+    char out[4096];
+    if (tmp[0] && tmp[1] == ':' && tmp[2] == '/') {
+        out[0] = '/'; out[1] = (char)tolower((unsigned char)tmp[0]);
+        strcpy(out + 2, tmp + 2);
+    } else {
+        strcpy(out, tmp);
+    }
+    size_t len = strlen(out); if (len + 1 > size) return -(int64_t)LINUX_EINVAL;
+    memcpy(buf, out, len + 1); return (int64_t)(len + 1);
 }
 
 static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
@@ -393,8 +509,10 @@ static int64_t sys_mmap(uint64_t hint, uint64_t len, uint32_t prot,
     DWORD wprot = linux_prot_to_win(prot);
     LPVOID addr = (flags & LINUX_MAP_FIXED) ? (LPVOID)(uintptr_t)hint : NULL;
     LPVOID p = VirtualAlloc(addr, (SIZE_T)alen, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!p && (flags & LINUX_MAP_FIXED)) return -(int64_t)LINUX_ENOMEM;
-    if (!p) p = VirtualAlloc(NULL, (SIZE_T)alen, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p && (flags & LINUX_MAP_FIXED))
+        p = VirtualAlloc(addr, (SIZE_T)alen, MEM_COMMIT, PAGE_READWRITE);
+    if (!p && !(flags & LINUX_MAP_FIXED))
+        p = VirtualAlloc(NULL, (SIZE_T)alen, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!p) return -(int64_t)LINUX_ENOMEM;
     if (fd >= 0 && !(flags & LINUX_MAP_ANON)) {
         HANDLE fh = (HANDLE)_get_osfhandle(fd);
@@ -414,13 +532,41 @@ static int64_t sys_munmap(uint64_t addr, uint64_t len)
 {
     uint64_t alen = (len + 0xFFFULL) & ~0xFFFULL;
     VirtualFree((LPVOID)(uintptr_t)addr, (SIZE_T)alen, MEM_DECOMMIT);
-    VirtualFree((LPVOID)(uintptr_t)addr, 0, MEM_RELEASE);
+    VirtualFree((LPVOID)(uintptr_t)addr, 0, MEM_RELEASE); /* succeeds only for base alloc */
     return 0;
 }
+
+#define LINUX_MAP_NORESERVE 0x4000
 
 static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot)
 {
     DWORD old = 0; return VirtualProtect((LPVOID)(uintptr_t)addr, (SIZE_T)len, linux_prot_to_win(prot), &old) ? 0 : -(int64_t)LINUX_EINVAL;
+}
+
+static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint32_t flags)
+{
+    uint64_t oa = old_addr & ~0xFFFULL;
+    uint64_t os = (old_size + 0xFFFULL) & ~0xFFFULL;
+    uint64_t ns = (new_size + 0xFFFULL) & ~0xFFFULL;
+
+    if (ns <= os) {
+        if (ns < os)
+            VirtualFree((LPVOID)(uintptr_t)(oa + ns), (SIZE_T)(os - ns), MEM_DECOMMIT);
+        return (int64_t)oa;
+    }
+
+    LPVOID ext = VirtualAlloc((LPVOID)(uintptr_t)(oa + os), (SIZE_T)(ns - os),
+                              MEM_COMMIT, PAGE_READWRITE);
+    if (ext) return (int64_t)oa;
+
+    if (!(flags & 1)) return -(int64_t)LINUX_ENOMEM;
+
+    LPVOID p = VirtualAlloc(NULL, (SIZE_T)ns, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) return -(int64_t)LINUX_ENOMEM;
+    memcpy(p, (void*)(uintptr_t)oa, (size_t)os);
+    VirtualFree((LPVOID)(uintptr_t)oa, (SIZE_T)os, MEM_DECOMMIT);
+    VirtualFree((LPVOID)(uintptr_t)oa, 0, MEM_RELEASE);
+    return (int64_t)(uintptr_t)p;
 }
 
 static int64_t sys_brk(uint64_t req)
@@ -432,13 +578,14 @@ static int64_t sys_brk(uint64_t req)
         brk_cur = brk_end = (uint64_t)(uintptr_t)r;
     }
     if (req == 0) return (int64_t)brk_cur;
-    if (req > brk_cur) {
-        uint64_t need = (req - brk_end + 0xFFFULL) & ~0xFFFULL;
+    uint64_t aligned = (req + 0xFFFULL) & ~0xFFFULL;
+    if (aligned > brk_end) {
+        uint64_t need = aligned - brk_end;
         if (!VirtualAlloc((LPVOID)(uintptr_t)brk_end, (SIZE_T)need, MEM_COMMIT, PAGE_READWRITE))
             return (int64_t)brk_cur;
-        brk_end += need;
+        brk_end = aligned;
     }
-    brk_cur = req; return (int64_t)brk_cur;
+    brk_cur = aligned; return (int64_t)brk_cur;
 }
 
 /* ─── Time ────────────────────────────────────────────────────────────────── */
@@ -707,7 +854,75 @@ static int64_t sys_poll(void* fds, uint32_t nfds, int timeout)
 
 static int64_t sys_getdents64(int fd, void* dirp, uint32_t count)
 {
-    (void)fd; (void)dirp; (void)count; return 0;
+    DirState* ds = NULL;
+    for (int i = 0; i < MAX_DIR_HANDLES; i++) {
+        if (g_dirs[i].fd == fd && g_dirs[i].started) { ds = &g_dirs[i]; break; }
+    }
+    if (!ds) {
+        for (int i = 0; i < MAX_DIR_HANDLES; i++) {
+            if (!g_dirs[i].started) { ds = &g_dirs[i]; break; }
+        }
+        if (!ds) return -(int64_t)LINUX_ENOMEM;
+        ds->fd = fd;
+        ds->started = true;
+        ds->finished = false;
+
+        char path[4096];
+        HANDLE h = fd_to_handle(fd);
+        DWORD plen = GetFinalPathNameByHandleA(h, path, sizeof(path) - 3, FILE_NAME_NORMALIZED);
+        if (plen == 0 || plen >= sizeof(path) - 3) {
+            GetCurrentDirectoryA(sizeof(path) - 3, path);
+        } else {
+            if (strncmp(path, "\\\\?\\", 4) == 0) memmove(path, path + 4, strlen(path + 4) + 1);
+        }
+        strcat(path, "\\*");
+        WIN32_FIND_DATAA fdata;
+        ds->hFind = FindFirstFileA(path, &fdata);
+        if (ds->hFind == INVALID_HANDLE_VALUE) { ds->finished = true; return 0; }
+
+        uint8_t* buf = (uint8_t*)dirp;
+        uint32_t pos = 0;
+        do {
+            size_t nlen = strlen(fdata.cFileName);
+            uint16_t reclen = (uint16_t)((19 + nlen + 1 + 7) & ~7);
+            if (pos + reclen > count) break;
+            memset(buf + pos, 0, reclen);
+            uint64_t ino = 1;  memcpy(buf + pos, &ino, 8);
+            int64_t  off = (int64_t)(pos + reclen); memcpy(buf + pos + 8, &off, 8);
+            memcpy(buf + pos + 16, &reclen, 2);
+            uint8_t dtype = (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
+            buf[pos + 18] = dtype;
+            memcpy(buf + pos + 19, fdata.cFileName, nlen);
+            pos += reclen;
+        } while (FindNextFileA(ds->hFind, &fdata));
+        if (GetLastError() == ERROR_NO_MORE_FILES) ds->finished = true;
+        return (int64_t)pos;
+    }
+
+    if (ds->finished) {
+        FindClose(ds->hFind);
+        ds->started = false;
+        return 0;
+    }
+
+    WIN32_FIND_DATAA fdata;
+    uint8_t* buf = (uint8_t*)dirp;
+    uint32_t pos = 0;
+    while (FindNextFileA(ds->hFind, &fdata)) {
+        size_t nlen = strlen(fdata.cFileName);
+        uint16_t reclen = (uint16_t)((19 + nlen + 1 + 7) & ~7);
+        if (pos + reclen > count) break;
+        memset(buf + pos, 0, reclen);
+        uint64_t ino = 1; memcpy(buf + pos, &ino, 8);
+        int64_t off = (int64_t)(pos + reclen); memcpy(buf + pos + 8, &off, 8);
+        memcpy(buf + pos + 16, &reclen, 2);
+        uint8_t dtype = (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 4 : 8;
+        buf[pos + 18] = dtype;
+        memcpy(buf + pos + 19, fdata.cFileName, nlen);
+        pos += reclen;
+    }
+    if (GetLastError() == ERROR_NO_MORE_FILES) ds->finished = true;
+    return (int64_t)pos;
 }
 
 static int64_t sys_ioctl(int fd, uint64_t req, uint64_t arg)
@@ -732,6 +947,8 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_open:        ret = (uint64_t)sys_open((char*)a1, (int)a2, (int)a3); break;
     case SYS_openat:      ret = (uint64_t)sys_openat((int)a1, (char*)a2, (int)a3, (int)a4); break;
     case SYS_close:       ret = (uint64_t)sys_close((int)a1); break;
+    case SYS_pread64:     ret = (uint64_t)sys_pread64((int)a1, (void*)a2, a3, a4); break;
+    case SYS_pwrite64:    ret = (uint64_t)sys_pwrite64((int)a1, (void*)a2, a3, a4); break;
     case SYS_lseek:       ret = (uint64_t)sys_lseek((int)a1, (int64_t)a2, (int)a3); break;
     case SYS_fcntl:       ret = (uint64_t)sys_fcntl((int)a1, (int)a2, a3); break;
     case SYS_access:      ret = (uint64_t)sys_access((char*)a1, (int)a2); break;
@@ -739,16 +956,33 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_ftruncate:   ret = (uint64_t)sys_ftruncate((int)a1, (int64_t)a2); break;
     case SYS_dup: { int r = _dup((int)a1); ret = r < 0 ? (uint64_t)-(int64_t)LINUX_EBADF : (uint64_t)r; } break;
     case SYS_dup2: { int r = _dup2((int)a1, (int)a2); ret = r < 0 ? (uint64_t)-(int64_t)LINUX_EBADF : a2; } break;
-    case SYS_pipe: case SYS_pipe2: ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_pipe: case SYS_pipe2: ret = (uint64_t)MineVFSPipe((int*)(uintptr_t)a1, (nr == SYS_pipe2) ? (int)a2 : 0); break;
     case SYS_getdents64:  ret = (uint64_t)sys_getdents64((int)a1, (void*)a2, (uint32_t)a3); break;
     case SYS_ioctl:       ret = (uint64_t)sys_ioctl((int)a1, a2, a3); break;
     case SYS_poll:        ret = (uint64_t)sys_poll((void*)a1, (uint32_t)a2, (int)a3); break;
     case SYS_select:      ret = 0; break;
     case SYS_fstat:       ret = (uint64_t)sys_fstat((int)a1, (Linux_stat*)a2); break;
     case SYS_stat: case SYS_lstat: ret = (uint64_t)sys_stat((char*)a1, (Linux_stat*)a2); break;
+    case SYS_newfstatat: {
+        const char* p = (const char*)a2;
+        if (p && *p) ret = (uint64_t)sys_stat(p, (Linux_stat*)a3);
+        else ret = (uint64_t)sys_fstat((int)a1, (Linux_stat*)a3);
+        break;
+    }
+    case SYS_readlinkat: {
+        const char* rpath = (a1 == (uint64_t)-100) ? (const char*)a2 : (const char*)a2;
+        int rvt = VFS_REAL;
+        MineVFSTranslate(rpath, &rvt);
+        if (rvt == VFS_PROC_SELF_EXE)
+            ret = (uint64_t)MineVFSReadlink(rvt, (char*)a3, a4);
+        else
+            ret = (uint64_t)-(int64_t)LINUX_ENOENT;
+        break;
+    }
     case SYS_mmap:        ret = (uint64_t)sys_mmap(a1, a2, (uint32_t)a3, (uint32_t)a4, (int)a5, a6); break;
     case SYS_munmap:      ret = (uint64_t)sys_munmap(a1, a2); break;
     case SYS_mprotect:    ret = (uint64_t)sys_mprotect(a1, a2, (uint32_t)a3); break;
+    case SYS_mremap:      ret = (uint64_t)sys_mremap(a1, a2, a3, (uint32_t)a4); break;
     case SYS_brk:         ret = (uint64_t)sys_brk(a1); break;
     case SYS_madvise: case SYS_mincore: case SYS_msync:
     case SYS_mlock: case SYS_munlock: case SYS_mlockall: case SYS_munlockall: ret = 0; break;
@@ -756,7 +990,15 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_clock_getres:  ret = (uint64_t)sys_clock_getres((int)a1, (Linux_timespec*)a2); break;
     case SYS_gettimeofday:  ret = (uint64_t)sys_gettimeofday((Linux_timeval*)a1, (void*)a2); break;
     case SYS_nanosleep:     ret = (uint64_t)sys_nanosleep((Linux_timespec*)a1, (Linux_timespec*)a2); break;
+    case SYS_clock_nanosleep: ret = (uint64_t)sys_nanosleep((Linux_timespec*)a3, (Linux_timespec*)a4); break;
     case SYS_settimeofday:  ret = 0; break;
+    case SYS_time: {
+        FILETIME ft; GetSystemTimeAsFileTime(&ft);
+        uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        t = (t - 116444736000000000ULL) / 10000000ULL;
+        if (a1) *(uint64_t*)a1 = t;
+        ret = t;
+    } break;
     case SYS_getpid:      ret = (uint64_t)GetCurrentProcessId(); break;
     case SYS_getppid:     ret = (uint64_t)GetCurrentProcessId(); break;
     case SYS_getpgrp:     ret = (uint64_t)GetCurrentProcessId(); break;
@@ -796,8 +1038,18 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_rt_sigaction: case SYS_rt_sigprocmask: case SYS_rt_sigreturn:
     case SYS_rt_sigsuspend: ret = 0; break;
     case SYS_capget: case SYS_capset: ret = 0; break;
+    case SYS_rseq:        ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_tgkill: case SYS_tkill: ret = 0; break;
     case SYS_chdir:       ret = SetCurrentDirectoryA((char*)a1) ? 0 : winerr(); break;
-    case SYS_readlink:    ret = (uint64_t)-(int64_t)LINUX_ENOENT; break;
+    case SYS_readlink: {
+        int rvt = VFS_REAL;
+        MineVFSTranslate((const char*)a1, &rvt);
+        if (rvt == VFS_PROC_SELF_EXE)
+            ret = (uint64_t)MineVFSReadlink(rvt, (char*)a2, a3);
+        else
+            ret = (uint64_t)-(int64_t)LINUX_ENOENT;
+        break;
+    }
     case SYS_mkdir:       ret = CreateDirectoryA((char*)a1, NULL) ? 0 : winerr(); break;
     case SYS_rmdir:       ret = RemoveDirectoryA((char*)a1) ? 0 : winerr(); break;
     case SYS_unlink:      ret = DeleteFileA((char*)a1) ? 0 : winerr(); break;

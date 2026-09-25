@@ -47,7 +47,7 @@ static LONG WINAPI VEHHandler(EXCEPTION_POINTERS* ep)
     {
         __try {
             uint8_t* rip = (uint8_t*)ctx->Rip;
-            if (rip[0] == 0x0F && rip[1] == 0x05)
+            if (rip[0] == 0x0F && rip[1] == 0x0B)
             {
                 ctx->Rax = MineSyscall(
                     ctx->Rax,
@@ -75,6 +75,27 @@ static LONG WINAPI VEHHandler(EXCEPTION_POINTERS* ep)
     }
 
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        __try {
+            uint8_t* rip = (uint8_t*)ctx->Rip;
+            bool has_fs = false;
+            for (int j = 0; j < 4 && !has_fs; j++) {
+                if (rip[j] == 0x64) { has_fs = true; break; }
+                if ((rip[j] >= 0x40 && rip[j] <= 0x4F) ||
+                    rip[j] == 0x66 || rip[j] == 0x67 ||
+                    rip[j] == 0xF0 || rip[j] == 0xF2 || rip[j] == 0xF3)
+                    continue;
+                break;
+            }
+            if (has_fs) {
+                uint64_t guest_fs = MineGetGuestFS();
+                if (guest_fs) {
+                    _writefsbase_u64(guest_fs);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
         fprintf(stderr, "\n[MinE] SIGSEGV \xe2\x80\x94 guest accessed 0x%016llX (%s)\n",
             (unsigned long long)er->ExceptionInformation[1],
             er->ExceptionInformation[0] ? "write" : "read");

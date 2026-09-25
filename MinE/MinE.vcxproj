@@ -133,24 +133,28 @@
     <ClCompile Include="mine.c" />
     <ClCompile Include="mine_dynamic.c" />
     <ClCompile Include="mine_load.c" />
+    <ClCompile Include="mine_patch.c" />
     <ClCompile Include="mine_stack.c" />
     <ClCompile Include="mine_thunk.cpp" />
     <ClCompile Include="mine_TLS.c" />
     <ClCompile Include="mine_trace.c" />
     <ClCompile Include="mine_VEH.cpp" />
     <ClCompile Include="syscall_translate.c" />
+    <ClCompile Include="mine_vfs.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="jump.h" />
     <ClInclude Include="mine.h" />
     <ClInclude Include="mine_dynamic.h" />
     <ClInclude Include="mine_load.h" />
+    <ClInclude Include="mine_patch.h" />
     <ClInclude Include="mine_stack.h" />
     <ClInclude Include="mine_thunk.h" />
     <ClInclude Include="mine_TLS.h" />
     <ClInclude Include="mine_trace.h" />
     <ClInclude Include="mine_VEH.h" />
     <ClInclude Include="syscall_translate.h" />
+    <ClInclude Include="mine_vfs.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="mine_ABI.asm">
@@ -158,7 +162,7 @@
     </MASM>
     <MASM Include="mine_jump.asm">
       <FileType>Document</FileType>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
     </MASM>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

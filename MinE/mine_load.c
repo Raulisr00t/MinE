@@ -46,8 +46,10 @@ typedef struct {
 
 /* ─── Constants ───────────────────────────────────────────────────────────── */
 
-#define PT_LOAD  1
-#define PF_X     0x1
+#define PT_LOAD   1
+#define PT_INTERP 3
+#define PT_PHDR   6
+#define PF_X      0x1
 #define PF_W     0x2
 #define PF_R     0x4
 
@@ -137,20 +139,32 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
         free(phbuf); CloseHandle(fh); return false;
     }
 
-    /* ── pass 1: VA range ── */
+    /* ── pass 1: VA range + PT_PHDR + PT_INTERP ── */
     uint64_t va_min = UINT64_MAX, va_max = 0;
     uint16_t load_count = 0;
+    uint64_t phdr_vaddr = 0;
 
     for (uint16_t i = 0; i < e_phnum; i++) {
-        uint32_t p_type; uint64_t p_vaddr, p_memsz;
+        uint32_t p_type; uint64_t p_vaddr, p_memsz, p_offset, p_filesz;
         if (bits == 64) {
             Elf64_Phdr* p = (Elf64_Phdr*)(phbuf + i * e_phentsize);
             p_type = p->p_type; p_vaddr = p->p_vaddr; p_memsz = p->p_memsz;
+            p_offset = p->p_offset; p_filesz = p->p_filesz;
         }
         else {
             Elf32_Phdr* p = (Elf32_Phdr*)(phbuf + i * e_phentsize);
             p_type = p->p_type; p_vaddr = p->p_vaddr; p_memsz = p->p_memsz;
+            p_offset = p->p_offset; p_filesz = p->p_filesz;
         }
+
+        if (p_type == PT_PHDR)
+            phdr_vaddr = p_vaddr;
+
+        if (p_type == PT_INTERP && p_filesz > 0 && p_filesz < sizeof(out->interp)) {
+            if (fread_at(fh, p_offset, out->interp, (DWORD)p_filesz))
+                out->interp[p_filesz] = '\0';
+        }
+
         if (p_type != PT_LOAD || p_memsz == 0) continue;
         if (PG_DOWN(p_vaddr) < va_min) va_min = PG_DOWN(p_vaddr);
         if (PG_UP(p_vaddr + p_memsz) > va_max) va_max = PG_UP(p_vaddr + p_memsz);
@@ -256,6 +270,12 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
         /* apply real page protection */
         DWORD old_prot;
         VirtualProtect(seg_region, (SIZE_T)seg_size, elf_prot(s.flags), &old_prot);
+
+        if ((s.flags & PF_X) && out->exec_seg_count < MINE_MAX_EXEC_SEGS) {
+            out->exec_segs[out->exec_seg_count].va = seg_va;
+            out->exec_segs[out->exec_seg_count].size = seg_size;
+            out->exec_seg_count++;
+        }
     }
 
     if (!ok) {
@@ -270,12 +290,15 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
     /* phdr_va: program headers are inside the first PT_LOAD segment.
      * The ELF spec says PT_PHDR gives the VA; if absent, use phoff
      * adjusted by the load bias (correct for PIE, 0 for ET_EXEC). */
-    out->phdr_va = e_phoff + load_bias;
+    out->phdr_va = phdr_vaddr ? phdr_vaddr + load_bias : out->base + e_phoff;
     out->phnum = e_phnum;
 
     printf("[MinE] Loaded OK  base=0x%llX  entry=0x%llX\n",
         (unsigned long long)out->base,
         (unsigned long long)out->entry);
+
+    if (out->interp[0])
+        printf("[MinE] PT_INTERP: %s\n", out->interp);
 
     free(phbuf);
     CloseHandle(fh);

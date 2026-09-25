@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 #include "mine_tls.h"
+#include "mine_dynamic.h"
 
 #include <Windows.h>
 #include <intrin.h>
@@ -30,13 +31,13 @@
 
 #pragma pack(push, 1)
 typedef struct {
-    uint64_t self;          /* 0x00 — must point to this struct             */
+    uint64_t self;          /* 0x00 ï¿½ must point to this struct             */
     uint64_t dtv;           /* 0x08                                         */
     uint64_t reserved1;     /* 0x10                                         */
     uint64_t reserved2;     /* 0x18                                         */
     uint64_t reserved3;     /* 0x20                                         */
-    uint64_t stack_guard;   /* 0x28 — stack canary                          */
-    uint64_t ptr_guard;     /* 0x30 — pointer guard                         */
+    uint64_t stack_guard;   /* 0x28 ï¿½ stack canary                          */
+    uint64_t ptr_guard;     /* 0x30 ï¿½ pointer guard                         */
     uint64_t reserved4;     /* 0x38                                         */
     /* padding to 64 bytes */
     uint8_t  pad[0x100 - 0x40];
@@ -46,7 +47,7 @@ typedef struct {
 static MineTCB* g_tcb = NULL;
 static uint64_t g_fs_base = 0;
 
-/* Try wrfsbase — available on Windows 10+ when CR4.FSGSBASE=1 */
+/* Try wrfsbase ï¿½ available on Windows 10+ when CR4.FSGSBASE=1 */
 static bool try_wrfsbase(uint64_t base)
 {
     __try {
@@ -91,7 +92,7 @@ bool MineTLSInit(void)
     /* FS:[0x00] must be a self-pointer */
     g_tcb->self = (uint64_t)(uintptr_t)g_tcb;
 
-    /* FS:[0x28] = stack canary — use a random value from Win32 */
+    /* FS:[0x28] = stack canary ï¿½ use a random value from Win32 */
     HCRYPTPROV cp = 0;
     if (CryptAcquireContextA(&cp, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
         CryptGenRandom(cp, 8, (BYTE*)&g_tcb->stack_guard);
@@ -113,11 +114,13 @@ bool MineTLSInit(void)
         printf("[MinE-TLS] FS base set via wrfsbase @ 0x%llX  canary=0x%llX\n",
             (unsigned long long)g_fs_base,
             (unsigned long long)g_tcb->stack_guard);
+        MineDynSetGuestFS(g_fs_base);
         ok = true;
     }
     else if (try_nt_set_fs(g_fs_base)) {
         printf("[MinE-TLS] FS base set via NtSetInformationThread @ 0x%llX\n",
             (unsigned long long)g_fs_base);
+        MineDynSetGuestFS(g_fs_base);
         ok = true;
     }
     else {

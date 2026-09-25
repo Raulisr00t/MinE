@@ -9,6 +9,7 @@
 #include <wincrypt.h>
 #include "mine_dynamic.h"
 #include "mine_thunk.h"
+#include "mine_vfs.h"
 #include <io.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -29,6 +30,11 @@ typedef int pid_t;
 typedef unsigned int uid_t;
 typedef unsigned int gid_t;
 typedef unsigned int mode_t;
+
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <direct.h>
 
 #ifndef _O_BINARY
 #define _O_BINARY 0x8000
@@ -821,11 +827,23 @@ static int stub_nanosleep2(const void* req, void* rem)
 /* ─── file I/O ──────────────────────────────────────────────────────────── */
 static int stub_open(const char* path, int flags, ...)
 {
-    (void)flags; return _open(path, _O_RDONLY | _O_BINARY);
+    int virt_type = VFS_REAL;
+    const char* win_path = MineVFSTranslate(path, &virt_type);
+    if (virt_type != VFS_REAL) {
+        if (virt_type == VFS_UNKNOWN) return -1;
+        return MineVFSOpen(virt_type, flags);
+    }
+    (void)flags;
+    return _open(win_path ? win_path : path, _O_RDONLY | _O_BINARY);
 }
-static int stub_close2(int fd) { return _close(fd); }
+static int stub_close2(int fd)
+{
+    if (MineVFSIsVFD(fd)) return MineVFSClose(fd);
+    return _close(fd);
+}
 static int stub_read(int fd, void* buf, size_t n)
 {
+    if (MineVFSIsVFD(fd)) return (int)MineVFSRead(fd, buf, (uint64_t)n);
     DWORD got = 0; ReadFile(fd_handle(fd), buf, (DWORD)n, &got, NULL); return (int)got;
 }
 static int64_t stub_lseek64(int fd, int64_t off, int w)
@@ -834,7 +852,14 @@ static int64_t stub_lseek64(int fd, int64_t off, int w)
 }
 static int stub_stat(const char* p, void* s) { (void)p; (void)s; return -1; }
 static int stub_fstat(int fd, void* s) { (void)fd; (void)s; return -1; }
-static int stub_access(const char* p, int m) { (void)m; return _access(p, 0); }
+static int stub_access(const char* p, int m)
+{
+    (void)m;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(p, &vt);
+    if (vt != VFS_REAL) return (vt == VFS_UNKNOWN) ? -1 : 0;
+    return _access(wp ? wp : p, 0);
+}
 static int stub_unlink(const char* p) { return _unlink(p); }
 static int stub_mkdir(const char* p, int m) { (void)m; return _mkdir(p); }
 static int stub_rmdir(const char* p) { return _rmdir(p); }
@@ -850,10 +875,24 @@ static int stub_fchmod(int fd, int m) { (void)fd; (void)m; return 0; }
 static int stub_rename(const char* o, const char* n) { return rename(o, n); }
 static int stub_link(const char* o, const char* n) { (void)o; (void)n; return -1; }
 static int stub_symlink(const char* t, const char* l) { (void)t; (void)l; return -1; }
-static int stub_readlink(const char* p, char* b, size_t n) { (void)p; (void)b; (void)n; return -1; }
+static int stub_readlink(const char* p, char* b, size_t n)
+{
+    int vt = VFS_REAL;
+    MineVFSTranslate(p, &vt);
+    if (vt == VFS_PROC_SELF_EXE)
+        return (int)MineVFSReadlink(vt, b, (uint64_t)n);
+    return -1;
+}
 static void* stub_fopen(const char* p, const char* m)
 {
-    FILE* f = fopen(p, m);
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(p, &vt);
+    if (vt != VFS_REAL) {
+        /* For virtual files opened via fopen, return our fake FILE-like object
+         * backed by VFS. For now, return NULL for unimplemented. */
+        return NULL;
+    }
+    FILE* f = fopen(wp ? wp : p, m);
     return f ? f : NULL;
 }
 static int stub_fread(void* p, size_t s, size_t n, void* f)
@@ -909,7 +948,7 @@ static pid_t stub_fork(void) { return -1; }  /* no fork on Windows */
 static int stub_waitpid(int p, int* s, int o) { (void)p; (void)s; (void)o; return -1; }
 static int stub_execve(const char* p, char** av, char** ev) { (void)p; (void)av; (void)ev; return -1; }
 static int stub_system(const char* cmd) { return system(cmd); }
-static int stub_pipe(int* fds) { return _pipe(fds, 4096, _O_BINARY); }
+static int stub_pipe(int* fds) { return (int)MineVFSPipe(fds, 0); }
 static int stub_dup(int fd) { return _dup(fd); }
 static int stub_dup2(int fd, int fd2) { return _dup2(fd, fd2); }
 static unsigned stub_sleep(unsigned s) { Sleep(s * 1000); return 0; }
@@ -1307,6 +1346,141 @@ static int stub_isoc23_strtoul(const char* s, char** e, int b)
     return (int)strtoul(s, e, b);
 }
 
+/* ─── getauxval ─────────────────────────────────────────────────────────── */
+#define LINUX_AT_PAGESZ   6
+#define LINUX_AT_CLKTCK   17
+#define LINUX_AT_HWCAP    16
+#define LINUX_AT_HWCAP2   26
+#define LINUX_AT_SECURE   23
+#define LINUX_AT_RANDOM   25
+#define LINUX_AT_PLATFORM 15
+#define LINUX_AT_EXECFN   31
+
+static uint8_t  g_auxval_random[16];
+static char     g_auxval_platform[] = "x86_64";
+static int      g_auxval_random_init = 0;
+
+static unsigned long stub_getauxval(unsigned long type)
+{
+    switch (type) {
+    case LINUX_AT_PAGESZ:  return 4096;
+    case LINUX_AT_CLKTCK:  return 100;
+    case LINUX_AT_HWCAP:   return 0x078bfbff;
+    case LINUX_AT_HWCAP2:  return 0;
+    case LINUX_AT_SECURE:  return 0;
+    case LINUX_AT_RANDOM:
+        if (!g_auxval_random_init) {
+            HCRYPTPROV p = 0;
+            if (CryptAcquireContextA(&p, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+                CryptGenRandom(p, 16, g_auxval_random);
+                CryptReleaseContext(p, 0);
+            }
+            g_auxval_random_init = 1;
+        }
+        return (unsigned long)(uintptr_t)g_auxval_random;
+    case LINUX_AT_PLATFORM: return (unsigned long)(uintptr_t)g_auxval_platform;
+    default: return 0;
+    }
+}
+
+/* ─── openat / fstatat / stat64 / lstat / open64 / pread64 / pwrite64 / readv / realpath ─ */
+static int stub_openat(int dirfd, const char* path, int flags, ...)
+{
+    (void)dirfd;
+    int virt_type = VFS_REAL;
+    const char* win_path = MineVFSTranslate(path, &virt_type);
+    if (virt_type != VFS_REAL) {
+        if (virt_type == VFS_UNKNOWN) return -1;
+        return MineVFSOpen(virt_type, flags);
+    }
+    const char* use = win_path ? win_path : path;
+    int oflags = _O_BINARY;
+    if ((flags & 3) == 0) oflags |= _O_RDONLY;
+    else if ((flags & 3) == 1) oflags |= _O_WRONLY;
+    else oflags |= _O_RDWR;
+    if (flags & 0x40) oflags |= _O_CREAT;
+    if (flags & 0x200) oflags |= _O_TRUNC;
+    if (flags & 0x400) oflags |= _O_APPEND;
+    return _open(use, oflags, 0666);
+}
+
+static int stub_fstatat(int dirfd, const char* path, void* buf, int flags)
+{
+    (void)dirfd; (void)flags;
+    if (!path || !buf) return -1;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    const char* use = wp ? wp : path;
+    struct _stat64 st;
+    if (_stat64(use, &st) != 0) return -1;
+    memset(buf, 0, 144);
+    return 0;
+}
+
+static int stub_stat64(const char* p, void* s) { return stub_fstatat(0, p, s, 0); }
+static int stub_fstat64(int fd, void* s) { (void)fd; (void)s; memset(s, 0, 144); return 0; }
+static int stub_lstat_fn(const char* p, void* s) { return stub_fstatat(0, p, s, 0); }
+static int stub_open64(const char* path, int flags, ...) { return stub_open(path, flags); }
+
+static int64_t stub_pread64(int fd, void* buf, size_t count, int64_t offset)
+{
+    int64_t old = _lseeki64(fd, 0, 1);
+    _lseeki64(fd, offset, 0);
+    DWORD got = 0;
+    ReadFile(fd_handle(fd), buf, (DWORD)count, &got, NULL);
+    _lseeki64(fd, old, 0);
+    return (int64_t)got;
+}
+
+static int64_t stub_pwrite64(int fd, const void* buf, size_t count, int64_t offset)
+{
+    int64_t old = _lseeki64(fd, 0, 1);
+    _lseeki64(fd, offset, 0);
+    DWORD written = 0;
+    WriteFile(fd_handle(fd), buf, (DWORD)count, &written, NULL);
+    _lseeki64(fd, old, 0);
+    return (int64_t)written;
+}
+
+typedef struct { void* iov_base; size_t iov_len; } dyn_iovec;
+static int64_t stub_readv(int fd, const dyn_iovec* iov, int iovcnt)
+{
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        DWORD got = 0;
+        ReadFile(fd_handle(fd), iov[i].iov_base, (DWORD)iov[i].iov_len, &got, NULL);
+        total += got;
+        if (got < (DWORD)iov[i].iov_len) break;
+    }
+    return total;
+}
+
+static char* stub_realpath(const char* path, char* resolved)
+{
+    if (!path) return NULL;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    const char* use = wp ? wp : path;
+    char full[MAX_PATH];
+    DWORD n = GetFullPathNameA(use, MAX_PATH, full, NULL);
+    if (n == 0 || n >= MAX_PATH) return NULL;
+    for (DWORD i = 0; i < n; i++) if (full[i] == '\\') full[i] = '/';
+    if (!resolved) resolved = (char*)malloc(n + 1);
+    if (!resolved) return NULL;
+    memcpy(resolved, full, n + 1);
+    return resolved;
+}
+
+static int stub_register_atfork(void* p, void* c, void* a, void* d)
+{
+    (void)p; (void)c; (void)a; (void)d; return 0;
+}
+
+static int stub_dl_iterate_phdr(void* cb, void* data)
+{
+    (void)cb; (void)data; return 0;
+}
+
 /* i18n stubs */
 static char* stub_textdomain(const char* d) { (void)d; return (char*)""; }
 static char* stub_bindtextdomain(const char* d, const char* p) { (void)d; (void)p; return (char*)""; }
@@ -1377,6 +1551,37 @@ static const char* stub_procps_uptime_sprint_short(void)
         snprintf(buf, sizeof(buf), " %llu:%02llu",
             (unsigned long long)hours, (unsigned long long)mins);
     return buf;
+}
+
+/* ─── TLS for dynamic binaries ─────────────────────────────────────────── */
+#define MINE_TLS_BLOCK_SIZE  4096
+static uint8_t  g_tls_block[MINE_TLS_BLOCK_SIZE];
+static uint64_t g_dtv[3];
+
+static void mine_tls_init_dtv(void)
+{
+    memset(g_tls_block, 0, sizeof(g_tls_block));
+    g_dtv[0] = 1;
+    g_dtv[1] = (uint64_t)(uintptr_t)g_tls_block;
+    g_dtv[2] = 0;
+    uint64_t fs = MineGetGuestFS();
+    if (fs) {
+        uint64_t* tcb = (uint64_t*)(uintptr_t)fs;
+        tcb[1] = (uint64_t)(uintptr_t)g_dtv;
+    }
+}
+
+static void* stub_tls_get_addr(void* ti_ptr)
+{
+    uint64_t* ti = (uint64_t*)ti_ptr;
+    uint64_t offset = ti[1];
+    return (void*)(g_tls_block + offset);
+}
+
+static int stub_vsnprintf_chk(char* s, size_t maxlen, int flag, size_t slen, const char* fmt, va_list ap)
+{
+    (void)flag; (void)slen;
+    return vsnprintf(s, maxlen, fmt, ap);
 }
 
 /* ─── __libc_start_main ───────────────────────────────────────────────────── */
@@ -1853,6 +2058,24 @@ static void init_stubs(void)
     S("is_selinux_enabled", stub_is_selinux_enabled);
     /* newer glibc */
     S("__isoc23_strtoul", stub_isoc23_strtoul);
+    /* critical for dynamic binaries */
+    S("getauxval", stub_getauxval);
+    S("openat", stub_openat);
+    S("fstatat", stub_fstatat);
+    S("fstatat64", stub_fstatat);
+    S("stat64", stub_stat64);
+    S("fstat64", stub_fstat64);
+    S("lstat", stub_lstat_fn);
+    S("lstat64", stub_lstat_fn);
+    S("open64", stub_open64);
+    S("pread64", stub_pread64);
+    S("pwrite64", stub_pwrite64);
+    S("readv", stub_readv);
+    S("realpath", stub_realpath);
+    S("__register_atfork", stub_register_atfork);
+    S("dl_iterate_phdr", stub_dl_iterate_phdr);
+    S("__tls_get_addr", stub_tls_get_addr);
+    S("__vsnprintf_chk", stub_vsnprintf_chk);
 #undef S
     s_stubs[i].name = NULL;
     s_stubs[i].fn = NULL;
@@ -1865,7 +2088,7 @@ typedef struct { const char* name; void* data; size_t size; } SymData;
 static char* g_progname = (char*)"mine";
 static char* g_progname_full = (char*)"mine";
 
-#define SYM_DATA_COUNT 10
+#define SYM_DATA_COUNT 12
 static SymData s_data[SYM_DATA_COUNT];
 
 static void init_sym_data(void)
@@ -1880,6 +2103,7 @@ static void init_sym_data(void)
     s_data[i].name = "opterr";         s_data[i].data = &g_opterr;         s_data[i].size = sizeof(int);   i++;
     s_data[i].name = "__progname";     s_data[i].data = &g_progname;       s_data[i].size = sizeof(char*); i++;
     s_data[i].name = "__progname_full"; s_data[i].data = &g_progname_full;  s_data[i].size = sizeof(char*); i++;
+    s_data[i].name = "environ";        s_data[i].data = &g_envp;           s_data[i].size = sizeof(char**); i++;
     s_data[i].name = NULL; s_data[i].data = NULL; s_data[i].size = 0;
 }
 
@@ -1927,7 +2151,14 @@ static void apply_rela(const Elf64_Rela* r, uint64_t bias,
         if (!S && sym_name && *sym_name) {
             if (strcmp(sym_name, "__libc_start_main") == 0)
                 S = (uint64_t)(uintptr_t)MineThunkFor((void*)stub_libc_start_main);
-            else { void* st = find_stub(sym_name); if (st) S = (uint64_t)(uintptr_t)st; }
+            else {
+                void* st = find_stub(sym_name);
+                if (st) S = (uint64_t)(uintptr_t)st;
+                else if (type == R_X86_64_GLOB_DAT) {
+                    const SymData* sd = find_data(sym_name);
+                    if (sd) S = (uint64_t)(uintptr_t)sd->data;
+                }
+            }
         }
         if ((type == R_X86_64_JUMP_SLOT || type == R_X86_64_GLOB_DAT) && sym_name && !S) {
             /* Unknown symbol — install a safe no-op thunk so calling it
@@ -1985,6 +2216,7 @@ bool MineDynLink(const char* path, MineImage* img)
 {
     init_stubs();
     init_sym_data();
+    mine_tls_init_dtv();
     g_envp = (char**)_environ;
 
     /* Set __progname to the binary filename (basename of path) */

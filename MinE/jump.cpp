@@ -4,7 +4,7 @@
 
 #if defined(_MSC_VER)
                                             
-extern void MineJump(uint64_t entry, uint64_t rsp);
+extern void MineJump(uint64_t entry, uint64_t rsp, uint64_t fs_base);
 
 #elif defined(__GNUC__)
 
