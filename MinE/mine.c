@@ -9,6 +9,7 @@
 #include "mine_dynamic.h"
 #include "mine_tls.h"
 #include "mine_vfs.h"
+#include "mine_signal.h"
 #include "jump.h"
 
 #include <Windows.h>
@@ -178,9 +179,10 @@ bool CheckApp(LPCSTR path)
 
 void MineRun(LPCSTR path, int argc, const char* argv[])
 {
-    /* ── init VFS + tracer ── */
+    /* ── init VFS + tracer + signals ── */
     MineVFSInit(path);
     MineTraceInit();
+    MineSignalInit();
 
     printf("[MinE] Starting '%s'\n", path);
     printf("[MinE] Class : ELF%u  Arch : %s  Type : %s\n",

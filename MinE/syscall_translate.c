@@ -12,6 +12,10 @@
 #include "mine_dynamic.h"
 #include "mine_trace.h"
 #include "mine_vfs.h"
+#include "mine_signal.h"
+#include "mine_thread.h"
+#include "mine_process.h"
+#include "mine_TLS.h"
 #include <io.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -20,6 +24,7 @@
 #include <wincrypt.h>
 #include <intrin.h>
 
+#include <psapi.h>
 #pragma comment(lib, "ws2_32.lib")
 
    /* ─── Linux syscall numbers ───────────────────────────────────────────────── */
@@ -131,8 +136,54 @@
 #define SYS_clock_nanosleep   230
 #define SYS_tgkill            234
 #define SYS_settimeofday      164
+#define SYS_clone             56
+#define SYS_execve            59
+#define SYS_wait4             61
+#define SYS_socketpair        53
+#define SYS_epoll_create      213
+#define SYS_epoll_ctl         233
+#define SYS_epoll_wait        232
+#define SYS_epoll_create1     291
+#define SYS_epoll_pwait       281
+#define SYS_eventfd2          290
+#define SYS_dup3              292
 #define SYS_tkill             200
 #define SYS_time              201
+#define SYS_readv             19
+#define SYS_accept4           288
+#define SYS_ppoll             271
+#define SYS_pselect6          270
+#define SYS_recvmmsg          299
+#define SYS_sendmmsg          307
+#define SYS_timerfd_create    283
+#define SYS_timerfd_settime   286
+#define SYS_timerfd_gettime   287
+#define SYS_signalfd4         289
+#define SYS_inotify_init1     294
+#define SYS_inotify_add_watch 254
+#define SYS_inotify_rm_watch  255
+#define SYS_statfs            137
+#define SYS_fstatfs           138
+#define SYS_faccessat         269
+#define SYS_faccessat2        439
+#define SYS_fadvise64         221
+#define SYS_fallocate         285
+#define SYS_sync              162
+#define SYS_syncfs            306
+#define SYS_fdatasync         75
+#define SYS_fsync             74
+#define SYS_flock             73
+#define SYS_truncate          76
+#define SYS_getdents          78
+#define SYS_utimensat         280
+#define SYS_renameat          264
+#define SYS_renameat2         316
+#define SYS_unlinkat          263
+#define SYS_mkdirat           258
+#define SYS_fchmodat          268
+#define SYS_fchownat          260
+#define SYS_linkat            265
+#define SYS_symlinkat         266
 
 /* ─── Linux errno ─────────────────────────────────────────────────────────── */
 #define LINUX_EPERM      1
@@ -488,9 +539,69 @@ static int64_t sys_getcwd(char* buf, uint64_t size)
     memcpy(buf, out, len + 1); return (int64_t)(len + 1);
 }
 
+/* ─── Per-fd flags tracking ──────────────────────────────────────────────── */
+#define MAX_FD_TRACK 1024
+static struct { int flags; bool used; } g_fd_flags[MAX_FD_TRACK];
+
+static int get_fd_flags(int fd) {
+    if (fd >= 0 && fd < MAX_FD_TRACK && g_fd_flags[fd].used) return g_fd_flags[fd].flags;
+    return 0;
+}
+static void set_fd_flags(int fd, int flags) {
+    if (fd >= 0 && fd < MAX_FD_TRACK) { g_fd_flags[fd].flags = flags; g_fd_flags[fd].used = true; }
+}
+
+#define LINUX_F_DUPFD     0
+#define LINUX_F_GETFD     1
+#define LINUX_F_SETFD     2
+#define LINUX_F_GETFL     3
+#define LINUX_F_SETFL     4
+#define LINUX_F_GETLK     5
+#define LINUX_F_SETLK     6
+#define LINUX_F_SETLKW    7
+#define LINUX_F_DUPFD_CLOEXEC 1030
+#define LINUX_O_NONBLOCK  0x800
+#define LINUX_O_CLOEXEC   0x80000
+#define LINUX_FD_CLOEXEC  1
+
 static int64_t sys_fcntl(int fd, int cmd, uint64_t arg)
 {
- (void)fd; (void)arg; switch (cmd) { case 1:case 2:case 3:case 4:case 7:return 0; } return -(int64_t)LINUX_EINVAL;
+    switch (cmd) {
+    case LINUX_F_DUPFD:
+    case LINUX_F_DUPFD_CLOEXEC: {
+        int newfd = _dup(fd);
+        if (newfd < 0) return -(int64_t)LINUX_EBADF;
+        set_fd_flags(newfd, get_fd_flags(fd));
+        return newfd;
+    }
+    case LINUX_F_GETFD:
+        return (get_fd_flags(fd) & LINUX_FD_CLOEXEC) ? LINUX_FD_CLOEXEC : 0;
+    case LINUX_F_SETFD:
+        if ((int)arg & LINUX_FD_CLOEXEC)
+            set_fd_flags(fd, get_fd_flags(fd) | LINUX_FD_CLOEXEC);
+        else
+            set_fd_flags(fd, get_fd_flags(fd) & ~LINUX_FD_CLOEXEC);
+        return 0;
+    case LINUX_F_GETFL:
+        return get_fd_flags(fd) & ~LINUX_FD_CLOEXEC;
+    case LINUX_F_SETFL: {
+        int fl = get_fd_flags(fd);
+        fl = (fl & LINUX_FD_CLOEXEC) | ((int)arg & ~LINUX_FD_CLOEXEC);
+        set_fd_flags(fd, fl);
+        if ((int)arg & LINUX_O_NONBLOCK) {
+            SOCKET s = (SOCKET)_get_osfhandle(fd);
+            if (s != (SOCKET)INVALID_HANDLE_VALUE) {
+                u_long mode = 1;
+                ioctlsocket(s, FIONBIO, &mode);
+            }
+        }
+        return 0;
+    }
+    case LINUX_F_GETLK: case LINUX_F_SETLK: case LINUX_F_SETLKW:
+        return 0;
+    default:
+        return 0;
+    }
 }
 
 static int64_t sys_ftruncate(int fd, int64_t len)
@@ -847,11 +958,6 @@ static int64_t sys_recvmsg(int fd, Linux_msghdr* msg, int flags)
     return (int64_t)n;
 }
 
-static int64_t sys_poll(void* fds, uint32_t nfds, int timeout)
-{
-    (void)fds; (void)nfds; if (timeout > 0)Sleep((DWORD)timeout); return 0;
-}
-
 static int64_t sys_getdents64(int fd, void* dirp, uint32_t count)
 {
     DirState* ds = NULL;
@@ -925,9 +1031,312 @@ static int64_t sys_getdents64(int fd, void* dirp, uint32_t count)
     return (int64_t)pos;
 }
 
+#define LINUX_TIOCGWINSZ  0x5413
+#define LINUX_TIOCSWINSZ  0x5414
+#define LINUX_FIONREAD    0x541B
+#define LINUX_TCGETS      0x5401
+
+#pragma pack(push, 1)
+typedef struct { uint16_t ws_row; uint16_t ws_col; uint16_t ws_xpixel; uint16_t ws_ypixel; } Linux_winsize;
+#pragma pack(pop)
+
 static int64_t sys_ioctl(int fd, uint64_t req, uint64_t arg)
 {
-    (void)fd; (void)req; (void)arg; return -(int64_t)LINUX_ENOTTY;
+    switch (req) {
+    case LINUX_TIOCGWINSZ: {
+        Linux_winsize* ws = (Linux_winsize*)(uintptr_t)arg;
+        if (!ws) return -(int64_t)LINUX_EFAULT;
+        HANDLE h = fd_to_handle(fd);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (h && GetConsoleScreenBufferInfo(h, &csbi)) {
+            ws->ws_col = (uint16_t)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+            ws->ws_row = (uint16_t)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+        } else {
+            ws->ws_col = 80;
+            ws->ws_row = 24;
+        }
+        ws->ws_xpixel = 0;
+        ws->ws_ypixel = 0;
+        return 0;
+    }
+    case LINUX_TIOCSWINSZ:
+        return 0;
+    case LINUX_FIONREAD: {
+        uint32_t* nbytes = (uint32_t*)(uintptr_t)arg;
+        if (!nbytes) return -(int64_t)LINUX_EFAULT;
+        HANDLE h = fd_to_handle(fd);
+        DWORD avail = 0;
+        if (h && PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL))
+            *nbytes = avail;
+        else
+            *nbytes = 0;
+        return 0;
+    }
+    case LINUX_TCGETS:
+        if (fd <= 2) return 0;
+        return -(int64_t)LINUX_ENOTTY;
+    default:
+        return -(int64_t)LINUX_ENOTTY;
+    }
+}
+
+/* ─── sysinfo ─────────────────────────────────────────────────────────────── */
+#pragma pack(push,1)
+typedef struct {
+    int64_t  uptime;
+    uint64_t loads[3];
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint32_t pad2;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+} Linux_sysinfo;
+#pragma pack(pop)
+
+static int64_t sys_sysinfo(void* buf)
+{
+    if (!buf) return -(int64_t)LINUX_EFAULT;
+    Linux_sysinfo* si = (Linux_sysinfo*)buf;
+    memset(si, 0, sizeof(*si));
+
+    si->uptime = (int64_t)(GetTickCount64() / 1000ULL);
+    si->loads[0] = 0; si->loads[1] = 0; si->loads[2] = 0;
+
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        si->totalram = ms.ullTotalPhys;
+        si->freeram = ms.ullAvailPhys;
+        si->totalswap = ms.ullTotalPageFile - ms.ullTotalPhys;
+        si->freeswap = ms.ullAvailPageFile > ms.ullTotalPhys
+            ? ms.ullAvailPageFile - ms.ullTotalPhys : 0;
+    }
+
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    si->procs = (uint16_t)sysinfo.dwNumberOfProcessors;
+    si->mem_unit = 1;
+    return 0;
+}
+
+/* ─── getrusage ───────────────────────────────────────────────────────────── */
+typedef struct {
+    Linux_timeval ru_utime;
+    Linux_timeval ru_stime;
+    int64_t ru_maxrss;
+    int64_t ru_ixrss;
+    int64_t ru_idrss;
+    int64_t ru_isrss;
+    int64_t ru_minflt;
+    int64_t ru_majflt;
+    int64_t ru_nswap;
+    int64_t ru_inblock;
+    int64_t ru_oublock;
+    int64_t ru_msgsnd;
+    int64_t ru_msgrcv;
+    int64_t ru_nsignals;
+    int64_t ru_nvcsw;
+    int64_t ru_nivcsw;
+} Linux_rusage;
+
+static int64_t sys_getrusage(int who, void* buf)
+{
+    if (!buf) return -(int64_t)LINUX_EFAULT;
+    Linux_rusage* ru = (Linux_rusage*)buf;
+    memset(ru, 0, sizeof(*ru));
+
+    FILETIME ct, et, kt, ut;
+    HANDLE h = (who == 0) ? GetCurrentProcess() : GetCurrentThread();
+    if (GetProcessTimes(h, &ct, &et, &kt, &ut)) {
+        ULARGE_INTEGER k, u;
+        k.LowPart = kt.dwLowDateTime; k.HighPart = kt.dwHighDateTime;
+        u.LowPart = ut.dwLowDateTime; u.HighPart = ut.dwHighDateTime;
+        uint64_t kus = k.QuadPart / 10;
+        uint64_t uus = u.QuadPart / 10;
+        ru->ru_stime.tv_sec = (int64_t)(kus / 1000000ULL);
+        ru->ru_stime.tv_usec = (int64_t)(kus % 1000000ULL);
+        ru->ru_utime.tv_sec = (int64_t)(uus / 1000000ULL);
+        ru->ru_utime.tv_usec = (int64_t)(uus % 1000000ULL);
+    }
+
+    PROCESS_MEMORY_COUNTERS pmc;
+    memset(&pmc, 0, sizeof(pmc));
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        ru->ru_maxrss = (int64_t)(pmc.PeakWorkingSetSize / 1024);
+        ru->ru_minflt = (int64_t)pmc.PageFaultCount;
+    }
+    return 0;
+}
+
+/* ─── sendfile ────────────────────────────────────────────────────────────── */
+static int64_t sys_sendfile(int out_fd, int in_fd, int64_t* offset, uint64_t count)
+{
+    HANDLE hin = (HANDLE)_get_osfhandle(in_fd);
+    if (hin == INVALID_HANDLE_VALUE) return -(int64_t)LINUX_EBADF;
+
+    if (offset) {
+        LARGE_INTEGER li; li.QuadPart = *offset;
+        SetFilePointerEx(hin, li, NULL, FILE_BEGIN);
+    }
+
+    char buf[8192];
+    int64_t total = 0;
+    while ((uint64_t)total < count) {
+        DWORD to_read = (DWORD)((count - total) < sizeof(buf) ? (count - total) : sizeof(buf));
+        DWORD got = 0;
+        if (!ReadFile(hin, buf, to_read, &got, NULL) || got == 0) break;
+        int64_t w = sys_write(out_fd, buf, got);
+        if (w < 0) return total > 0 ? total : w;
+        total += w;
+        if ((uint64_t)w < got) break;
+    }
+
+    if (offset) *offset += total;
+    return total;
+}
+
+/* ─── readv ───────────────────────────────────────────────────────────────── */
+static int64_t sys_readv(int fd, const Linux_iovec* iov, int iovcnt)
+{
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        int64_t n = sys_read(fd, (void*)(uintptr_t)iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint64_t)n < iov[i].iov_len) break;
+    }
+    return total;
+}
+
+/* ─── eventfd ─────────────────────────────────────────────────────────────── */
+#define MAX_EVENTFDS 32
+static struct {
+    bool used;
+    int  fd_read;
+    int  fd_write;
+    int  efd;
+    uint64_t counter;
+    CRITICAL_SECTION lock;
+    bool semaphore;
+} g_eventfds[MAX_EVENTFDS];
+static int g_eventfd_next = 2000;
+
+static int64_t sys_eventfd(uint32_t initval, int flags)
+{
+    for (int i = 0; i < MAX_EVENTFDS; i++) {
+        if (!g_eventfds[i].used) {
+            int fds[2];
+            if (MineVFSPipe(fds, 0) < 0) return -(int64_t)LINUX_EMFILE;
+            g_eventfds[i].used = true;
+            g_eventfds[i].fd_read = fds[0];
+            g_eventfds[i].fd_write = fds[1];
+            g_eventfds[i].efd = g_eventfd_next++;
+            g_eventfds[i].counter = initval;
+            g_eventfds[i].semaphore = !!(flags & 0x1);
+            InitializeCriticalSection(&g_eventfds[i].lock);
+            if (initval > 0) {
+                uint8_t one = 1;
+                sys_write(g_eventfds[i].fd_write, &one, 1);
+            }
+            return g_eventfds[i].fd_read;
+        }
+    }
+    return -(int64_t)LINUX_EMFILE;
+}
+
+/* ─── clone (basic thread creation) ───────────────────────────────────────── */
+#define LINUX_CLONE_VM         0x00000100
+#define LINUX_CLONE_FS         0x00000200
+#define LINUX_CLONE_FILES      0x00000400
+#define LINUX_CLONE_SIGHAND    0x00000800
+#define LINUX_CLONE_THREAD     0x00010000
+#define LINUX_CLONE_SETTLS     0x00080000
+#define LINUX_CLONE_PARENT_SETTID 0x00100000
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000
+#define LINUX_CLONE_CHILD_SETTID  0x01000000
+
+typedef struct {
+    uint64_t fn;
+    uint64_t child_stack;
+    uint64_t arg;
+    uint64_t tls;
+    uint64_t ctid;
+} CloneCtx;
+
+extern void MineWinToLinux(void);
+
+static DWORD WINAPI clone_thread_entry(LPVOID param)
+{
+    CloneCtx* ctx = (CloneCtx*)param;
+    uint64_t fn = ctx->fn;
+    uint64_t child_stack = ctx->child_stack;
+    uint64_t arg = ctx->arg;
+    uint64_t tls = ctx->tls;
+    uint64_t ctid = ctx->ctid;
+    free(ctx);
+
+    MineTLSInitThread();
+
+    if (tls) {
+        MineDynSetGuestFS(tls);
+        __try { _writefsbase_u64(tls); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    DWORD tid = GetCurrentThreadId();
+    if (ctid) *(uint32_t*)(uintptr_t)ctid = (uint32_t)tid;
+
+    typedef int(*win_fn_t)(void*, uint64_t, uint64_t, uint64_t);
+    int ret = ((win_fn_t)MineWinToLinux)((void*)(uintptr_t)fn, arg, 0, 0);
+
+    if (ctid) {
+        *(uint32_t*)(uintptr_t)ctid = 0;
+        MineFutex((uint32_t*)(uintptr_t)ctid, 1, 1, NULL, NULL, 0);
+    }
+
+    return (DWORD)ret;
+}
+
+static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
+    uint64_t ptid, uint64_t ctid, uint64_t tls)
+{
+    if (!(flags & LINUX_CLONE_THREAD)) {
+        return -(int64_t)LINUX_ENOSYS;
+    }
+
+    CloneCtx* ctx = (CloneCtx*)calloc(1, sizeof(CloneCtx));
+    if (!ctx) return -(int64_t)LINUX_ENOMEM;
+
+    ctx->child_stack = child_stack;
+    ctx->tls = (flags & LINUX_CLONE_SETTLS) ? tls : 0;
+    ctx->ctid = (flags & LINUX_CLONE_CHILD_CLEARTID) ? ctid : 0;
+
+    if (child_stack) {
+        uint64_t* sp = (uint64_t*)(uintptr_t)child_stack;
+        ctx->fn = *(sp - 1);
+        ctx->arg = *(sp - 2);
+    }
+
+    DWORD tid = 0;
+    HANDLE h = CreateThread(NULL, 0, clone_thread_entry, ctx, 0, &tid);
+    if (!h) {
+        free(ctx);
+        return -(int64_t)LINUX_ENOMEM;
+    }
+
+    if ((flags & LINUX_CLONE_PARENT_SETTID) && ptid)
+        *(uint32_t*)(uintptr_t)ptid = (uint32_t)tid;
+
+    CloseHandle(h);
+    return (int64_t)tid;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -959,8 +1368,8 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_pipe: case SYS_pipe2: ret = (uint64_t)MineVFSPipe((int*)(uintptr_t)a1, (nr == SYS_pipe2) ? (int)a2 : 0); break;
     case SYS_getdents64:  ret = (uint64_t)sys_getdents64((int)a1, (void*)a2, (uint32_t)a3); break;
     case SYS_ioctl:       ret = (uint64_t)sys_ioctl((int)a1, a2, a3); break;
-    case SYS_poll:        ret = (uint64_t)sys_poll((void*)a1, (uint32_t)a2, (int)a3); break;
-    case SYS_select:      ret = 0; break;
+    case SYS_poll:        ret = (uint64_t)MinePoll((void*)a1, (uint32_t)a2, (int)a3); break;
+    case SYS_select:      ret = (uint64_t)MineSelect((int)a1, (void*)a2, (void*)a3, (void*)a4, (void*)a5); break;
     case SYS_fstat:       ret = (uint64_t)sys_fstat((int)a1, (Linux_stat*)a2); break;
     case SYS_stat: case SYS_lstat: ret = (uint64_t)sys_stat((char*)a1, (Linux_stat*)a2); break;
     case SYS_newfstatat: {
@@ -1011,7 +1420,9 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_getrlimit:   ret = (uint64_t)sys_getrlimit((uint32_t)a1, (Linux_rlimit*)a2); break;
     case SYS_prlimit64:   ret = (uint64_t)sys_getrlimit((uint32_t)a2, (Linux_rlimit*)a4); break;
     case SYS_getrandom:   ret = (uint64_t)sys_getrandom((void*)a1, a2, (uint32_t)a3); break;
-    case SYS_sysinfo: case SYS_times: case SYS_getrusage: ret = 0; break;
+    case SYS_sysinfo: ret = (uint64_t)sys_sysinfo((void*)a1); break;
+    case SYS_getrusage: ret = (uint64_t)sys_getrusage((int)a1, (void*)a2); break;
+    case SYS_times: ret = 0; break;
     case SYS_arch_prctl:  ret = (uint64_t)sys_arch_prctl(a1, a2); break;
     case SYS_socket:      ret = (uint64_t)sys_socket((int)a1, (int)a2, (int)a3); break;
     case SYS_bind:        ret = (uint64_t)sys_bind((int)a1, (void*)a2, (uint32_t)a3); break;
@@ -1027,19 +1438,105 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_recvfrom:    ret = (uint64_t)sys_recvfrom((int)a1, (void*)a2, a3, (int)a4, (void*)a5, (uint32_t*)a6); break;
     case SYS_sendmsg:     ret = (uint64_t)sys_sendmsg((int)a1, (Linux_msghdr*)a2, (int)a3); break;
     case SYS_recvmsg:     ret = (uint64_t)sys_recvmsg((int)a1, (Linux_msghdr*)a2, (int)a3); break;
-    case SYS_sendfile:    ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_sendfile:    ret = (uint64_t)sys_sendfile((int)a1, (int)a2, (int64_t*)a3, a4); break;
+    case SYS_clone:       ret = (uint64_t)sys_clone(a1, a2, a3, a4, a5); break;
+    case SYS_readv:       ret = (uint64_t)sys_readv((int)a1, (Linux_iovec*)a2, (int)a3); break;
+    case SYS_accept4:     ret = (uint64_t)sys_accept((int)a1, (void*)a2, (uint32_t*)a3); break;
+    case SYS_ppoll:       ret = (uint64_t)MinePoll((void*)a1, (uint32_t)a2, -1); break;
+    case SYS_pselect6:    ret = (uint64_t)MineSelect((int)a1, (void*)a2, (void*)a3, (void*)a4, (void*)a5); break;
+    case SYS_recvmmsg:    ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_sendmmsg:    ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_timerfd_create:  ret = (uint64_t)MineTimerfdCreate((int)a1, (int)a2); break;
+    case SYS_timerfd_settime: ret = (uint64_t)MineTimerfdSettime((int)a1, (int)a2, (void*)a3, (void*)a4); break;
+    case SYS_timerfd_gettime: ret = (uint64_t)MineTimerfdGettime((int)a1, (void*)a2); break;
+    case SYS_signalfd4:   ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_inotify_init1: ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_inotify_add_watch: ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_inotify_rm_watch: ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
+    case SYS_faccessat: case SYS_faccessat2:
+        ret = (uint64_t)sys_access((char*)a2, (int)a3); break;
+    case SYS_fadvise64:   ret = 0; break;
+    case SYS_fallocate: {
+        HANDLE h = (HANDLE)_get_osfhandle((int)a1);
+        if (h == INVALID_HANDLE_VALUE) { ret = (uint64_t)-(int64_t)LINUX_EBADF; break; }
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)(a3 + a4);
+        SetFilePointerEx(h, li, NULL, FILE_BEGIN);
+        SetEndOfFile(h);
+        ret = 0;
+    } break;
+    case SYS_sync: case SYS_syncfs: ret = 0; break;
+    case SYS_fdatasync: case SYS_fsync: {
+        HANDLE h = (HANDLE)_get_osfhandle((int)a1);
+        if (h != INVALID_HANDLE_VALUE) FlushFileBuffers(h);
+        ret = 0;
+    } break;
+    case SYS_flock: ret = 0; break;
+    case SYS_truncate: {
+        HANDLE h = CreateFileA((char*)a1, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) { ret = (uint64_t)winerr(); break; }
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)a2;
+        SetFilePointerEx(h, li, NULL, FILE_BEGIN);
+        SetEndOfFile(h);
+        CloseHandle(h);
+        ret = 0;
+    } break;
+    case SYS_getdents:    ret = (uint64_t)sys_getdents64((int)a1, (void*)a2, (uint32_t)a3); break;
+    case SYS_utimensat:   ret = 0; break;
+    case SYS_renameat: case SYS_renameat2:
+        ret = MoveFileExA((char*)a2, (char*)a4, MOVEFILE_REPLACE_EXISTING) ? 0 : (uint64_t)winerr(); break;
+    case SYS_unlinkat: {
+        const char* p = (const char*)a2;
+        if ((int)a3 & 0x200) ret = RemoveDirectoryA(p) ? 0 : (uint64_t)winerr();
+        else ret = DeleteFileA(p) ? 0 : (uint64_t)winerr();
+    } break;
+    case SYS_mkdirat:     ret = CreateDirectoryA((char*)a2, NULL) ? 0 : (uint64_t)winerr(); break;
+    case SYS_fchmodat: case SYS_fchownat: case SYS_linkat: case SYS_symlinkat:
+        ret = 0; break;
+    case SYS_statfs: case SYS_fstatfs: {
+        if (!a2) { ret = (uint64_t)-(int64_t)LINUX_EFAULT; break; }
+        memset((void*)a2, 0, 120);
+        uint64_t* fs = (uint64_t*)a2;
+        fs[0] = 0xEF53; /* EXT4 magic */
+        fs[1] = 4096;   /* block size */
+        fs[2] = 4096;   /* fragment size */
+        ret = 0;
+    } break;
+    case SYS_execve:      ret = (uint64_t)MineExecve((const char*)a1, (char* const*)a2, (char* const*)a3); break;
+    case SYS_wait4:       ret = (uint64_t)MineWaitpid((int)a1, (int*)(uintptr_t)a2, (int)a3); break;
+    case SYS_socketpair:  ret = (uint64_t)MineVFSPipe((int*)(uintptr_t)a4, 0); break;
+    case SYS_epoll_create: case SYS_epoll_create1:
+        ret = (uint64_t)MineEpollCreate((int)a1); break;
+    case SYS_epoll_ctl:   ret = (uint64_t)MineEpollCtl((int)a1, (int)a2, (int)a3, (void*)a4); break;
+    case SYS_epoll_wait: case SYS_epoll_pwait:
+        ret = (uint64_t)MineEpollWait((int)a1, (void*)a2, (int)a3, (int)a4); break;
+    case SYS_eventfd2:    ret = (uint64_t)sys_eventfd((uint32_t)a1, (int)a2); break;
+    case SYS_dup3: {
+        int r = _dup2((int)a1, (int)a2);
+        ret = r < 0 ? (uint64_t)-(int64_t)LINUX_EBADF : a2;
+    } break;
     case SYS_set_tid_address: g_tid_addr = a1; ret = (uint64_t)GetCurrentThreadId(); break;
     case SYS_set_robust_list: g_robust_list = a1; ret = 0; break;
     case SYS_get_robust_list: ret = 0; break;
-    case SYS_futex:       ret = 0; break;
+    case SYS_futex:       ret = (uint64_t)MineFutex((uint32_t*)(uintptr_t)a1, (int)a2, (uint32_t)a3, (void*)a4, (uint32_t*)(uintptr_t)a5, (uint32_t)a6); break;
     case SYS_sched_yield: SwitchToThread(); ret = 0; break;
-    case SYS_sigaltstack: ret = 0; break;
+    case SYS_sigaltstack: ret = (uint64_t)MineSignalSigaltstack((void*)a1, (void*)a2); break;
     case SYS_prctl:       ret = 0; break;
-    case SYS_rt_sigaction: case SYS_rt_sigprocmask: case SYS_rt_sigreturn:
+    case SYS_rt_sigaction:
+        ret = (uint64_t)MineSignalAction((int)a1, (const MineSigAction*)a2,
+              (MineSigAction*)a3, a4);
+        break;
+    case SYS_rt_sigprocmask:
+        ret = (uint64_t)MineSignalProcmask((int)a1, (const uint64_t*)a2,
+              (uint64_t*)a3, a4);
+        break;
+    case SYS_rt_sigreturn: ret = 0; break;
     case SYS_rt_sigsuspend: ret = 0; break;
     case SYS_capget: case SYS_capset: ret = 0; break;
     case SYS_rseq:        ret = (uint64_t)-(int64_t)LINUX_ENOSYS; break;
-    case SYS_tgkill: case SYS_tkill: ret = 0; break;
+    case SYS_tgkill: case SYS_tkill:
+        MineSignalRaise((int)a3 ? (int)a3 : (int)a2);
+        ret = 0;
+        break;
     case SYS_chdir:       ret = SetCurrentDirectoryA((char*)a1) ? 0 : winerr(); break;
     case SYS_readlink: {
         int rvt = VFS_REAL;
@@ -1064,6 +1561,8 @@ uint64_t MineSyscall(uint64_t nr,
     }
 
     MineTraceExit(nr, ret);
- 
+
+    MineSignalDeliver();
+
     return ret;
 }

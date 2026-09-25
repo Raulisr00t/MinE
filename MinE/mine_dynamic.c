@@ -10,6 +10,9 @@
 #include "mine_dynamic.h"
 #include "mine_thunk.h"
 #include "mine_vfs.h"
+#include "mine_signal.h"
+#include "mine_thread.h"
+#include "mine_process.h"
 #include <io.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -327,12 +330,43 @@ static int stub_gettimeofday(void* tv, void* tz)
 
 static int stub_setitimer(int w, void* nv, void* ov) { (void)w; (void)nv; (void)ov; return 0; }
 static int stub_getpid(void) { return (int)GetCurrentProcessId(); }
-static int stub_sigaction(int s, void* a, void* o) { (void)s; (void)a; (void)o; return 0; }
-static int stub_sigprocmask(int h, void* s, void* o) { (void)h; (void)s; (void)o; return 0; }
-static int stub_sigemptyset(void* s) { if (s)memset(s, 0, 8); return 0; }
-static int stub_raise(int s) { (void)s; return 0; }
+static int stub_sigaction(int s, void* a, void* o)
+{
+    return (int)MineSignalAction(s, (const MineSigAction*)a, (MineSigAction*)o, 8);
+}
+static int stub_sigprocmask(int h, void* s, void* o)
+{
+    return (int)MineSignalProcmask(h, (const uint64_t*)s, (uint64_t*)o, 8);
+}
+static int stub_sigemptyset(void* s) { if (s)memset(s, 0, 16); return 0; }
+static int stub_raise(int s) { MineSignalRaise(s); return 0; }
 static int stub_prctl(int op, ...) { (void)op; return 0; }
-static int stub_ioctl(int fd, unsigned long r, ...) { (void)fd; (void)r; return 0; }
+static int stub_ioctl(int fd, unsigned long r, ...)
+{
+    if (r == 0x5413) { /* TIOCGWINSZ */
+        va_list ap; va_start(ap, r);
+        void* ws = va_arg(ap, void*);
+        va_end(ap);
+        if (!ws) return -14;
+        HANDLE h = fd_handle(fd);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        uint16_t cols = 80, rows = 24;
+        if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &csbi)) {
+            cols = (uint16_t)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+            rows = (uint16_t)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+        }
+        memset(ws, 0, 8);
+        ((uint16_t*)ws)[0] = rows;
+        ((uint16_t*)ws)[1] = cols;
+        return 0;
+    }
+    if (r == 0x5401) { /* TCGETS */
+        if (fd <= 2) return 0;
+        return -25; /* ENOTTY */
+    }
+    (void)fd;
+    return 0;
+}
 static int stub_sched_yield(void) { SwitchToThread(); return 0; }
 static void stub_error(int status, int err, const char* fmt, ...)
 {
@@ -405,7 +439,7 @@ static int stub_close_sock(int fd)
     /* _close handles both regular fds and socket fds wrapped with _open_osfhandle */
     return _close(fd);
 }
-static int stub_poll(void* fds, unsigned n, int to) { (void)fds; (void)n; if (to > 0)Sleep((DWORD)to); return 0; }
+static int stub_poll(void* fds, unsigned n, int to) { return (int)MinePoll(fds, n, to); }
 static const char* stub_inet_ntoa(struct in_addr in)
 {
     static char b[16]; InetNtopA(AF_INET, &in, b, sizeof(b)); return b;
@@ -865,9 +899,9 @@ static int stub_mkdir(const char* p, int m) { (void)m; return _mkdir(p); }
 static int stub_rmdir(const char* p) { return _rmdir(p); }
 static char* stub_getcwd(char* b, size_t n) { return _getcwd(b, (int)n); }
 static int stub_chdir(const char* p) { return _chdir(p); }
-static void* stub_opendir(const char* p) { (void)p; return NULL; }
-static void* stub_readdir(void* d) { (void)d; return NULL; }
-static int stub_closedir(void* d) { (void)d; return 0; }
+static void* stub_opendir(const char* p) { return MineOpendir(p); }
+static void* stub_readdir(void* d) { return MineReaddir((MineDIR*)d); }
+static int stub_closedir(void* d) { return MineClosedir((MineDIR*)d); }
 static int stub_truncate(const char* p, int64_t l) { (void)p; (void)l; return -1; }
 static int stub_ftruncate(int fd, int64_t l) { (void)fd; (void)l; return -1; }
 static int stub_chmod(const char* p, int m) { (void)p; (void)m; return 0; }
@@ -944,9 +978,10 @@ static int stub_madvise(void* a, size_t l, int adv) { (void)a; (void)l; (void)ad
 static int stub_msync(void* a, size_t l, int f) { (void)a; (void)l; (void)f; return 0; }
 static int stub_mlockall(int f) { (void)f; return 0; }
 static int stub_mlock(void* a, size_t l) { (void)a; (void)l; return 0; }
-static pid_t stub_fork(void) { return -1; }  /* no fork on Windows */
-static int stub_waitpid(int p, int* s, int o) { (void)p; (void)s; (void)o; return -1; }
-static int stub_execve(const char* p, char** av, char** ev) { (void)p; (void)av; (void)ev; return -1; }
+static pid_t stub_fork(void) { return (pid_t)MineFork(); }
+static int stub_waitpid(int p, int* s, int o) { return (int)MineWaitpid(p, s, o); }
+static int stub_execve(const char* p, char** av, char** ev) { return (int)MineExecve(p, av, ev); }
+static int stub_execvp(const char* f, char** av) { return (int)MineExecve(f, av, NULL); }
 static int stub_system(const char* cmd) { return system(cmd); }
 static int stub_pipe(int* fds) { return (int)MineVFSPipe(fds, 0); }
 static int stub_dup(int fd) { return _dup(fd); }
@@ -976,8 +1011,23 @@ static int stub_getpgrp(void) { return (int)GetCurrentProcessId(); }
 static int stub_getppid(void) { return 1; }
 static int stub_setpgid(int p, int g) { (void)p; (void)g; return 0; }
 static int stub_setsid(void) { return (int)GetCurrentProcessId(); }
-static int stub_kill(int p, int s) { (void)p; (void)s; return 0; }
-static int stub_signal(int s, void* h) { (void)s; (void)h; return 0; }
+static int stub_kill(int p, int s)
+{
+    /* Can only signal ourselves */
+    if (p == 0 || p == (int)GetCurrentProcessId() || p == -1) {
+        MineSignalRaise(s);
+        MineSignalDeliver();
+    }
+    return 0;
+}
+static uint64_t stub_signal(int s, void* h)
+{
+    MineSigAction act, old;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = (uint64_t)(uintptr_t)h;
+    MineSignalAction(s, &act, &old, 8);
+    return old.sa_handler;
+}
 static unsigned stub_umask(unsigned m) { (void)m; return 022; }
 static int stub_chown(const char* p, unsigned u, unsigned g) { (void)p; (void)u; (void)g; return 0; }
 static int stub_lchown(const char* p, unsigned u, unsigned g) { (void)p; (void)u; (void)g; return 0; }
@@ -1082,7 +1132,7 @@ static int stub_shutdown(int s, int h)
 }
 static int stub_select(int n, void* r, void* w, void* e, void* t)
 {
-    (void)n; (void)r; (void)w; (void)e; (void)t; return 0;
+    return (int)MineSelect(n, r, w, e, t);
 }
 static char* stub_inet_addr_str(const char* s)
 {
@@ -1134,23 +1184,197 @@ static void* stub_dlopen(const char* p, int f) { (void)p; (void)f; return NULL; 
 static void* stub_dlsym(void* h, const char* s) { (void)h; (void)s; return NULL; }
 static int   stub_dlclose(void* h) { (void)h; return 0; }
 static char* stub_dlerror(void) { return (char*)"dlopen not supported"; }
-static int   stub_pthread_create(void** t, void* a, void* fn, void* arg) { (void)t; (void)a; (void)fn; (void)arg; return 11; }
-static int   stub_pthread_join(void* t, void** r) { (void)t; (void)r; return 0; }
-static int   stub_pthread_mutex_init(void* m, void* a) { (void)m; (void)a; return 0; }
-static int   stub_pthread_mutex_lock(void* m) { (void)m; return 0; }
-static int   stub_pthread_mutex_unlock(void* m) { (void)m; return 0; }
-static int   stub_pthread_mutex_destroy(void* m) { (void)m; return 0; }
-static int   stub_pthread_key_create(void* k, void* d) { (void)k; (void)d; return 0; }
-static void* stub_pthread_getspecific(void* k) { (void)k; return NULL; }
-static int   stub_pthread_setspecific(void* k, void* v) { (void)k; (void)v; return 0; }
-static int   stub_pthread_once(void* o, void* fn) { (void)o; (void)fn; return 0; }
+static int stub_pthread_create(void** t, void* a, void* fn, void* arg)
+{
+    MineThread mt;
+    int r = MineThreadCreate(&mt, a, (uint64_t)(uintptr_t)fn, (uint64_t)(uintptr_t)arg);
+    if (r == 0 && t) *t = (void*)(uintptr_t)mt.tid;
+    return r;
+}
+static int stub_pthread_join(void* t, void** r)
+{
+    MineThread mt;
+    mt.handle = OpenThread(SYNCHRONIZE, FALSE, (DWORD)(uintptr_t)t);
+    mt.tid = (uint64_t)(uintptr_t)t;
+    if (!mt.handle) return 3; /* ESRCH */
+    return MineThreadJoin(mt, r);
+}
+static int stub_pthread_detach(void* t)
+{
+    (void)t;
+    return 0;
+}
+
+/*
+ * Mutex: Linux pthread_mutex_t is 40 bytes. We store a MineMutex
+ * at the start. The first 8 bytes hold the CS pointer.
+ * We lazily init on first lock if not explicitly initialized.
+ */
+static int stub_pthread_mutex_init(void* m, void* a)
+{
+    if (!m) return 22;
+    memset(m, 0, 40);
+    return MineMutexInit((MineMutex*)m, a);
+}
+static int stub_pthread_mutex_lock(void* m)
+{
+    if (!m) return 22;
+    MineMutex* mm = (MineMutex*)m;
+    if (!mm->cs) MineMutexInit(mm, NULL);
+    return MineMutexLock(mm);
+}
+static int stub_pthread_mutex_trylock(void* m)
+{
+    if (!m) return 22;
+    MineMutex* mm = (MineMutex*)m;
+    if (!mm->cs) MineMutexInit(mm, NULL);
+    return MineMutexTrylock(mm);
+}
+static int stub_pthread_mutex_unlock(void* m)
+{
+    if (!m) return 22;
+    MineMutex* mm = (MineMutex*)m;
+    if (!mm->cs) return 0;
+    return MineMutexUnlock(mm);
+}
+static int stub_pthread_mutex_destroy(void* m)
+{
+    if (!m) return 0;
+    return MineMutexDestroy((MineMutex*)m);
+}
+
+static int stub_pthread_cond_init(void* c, void* a)
+{
+    if (!c) return 22;
+    memset(c, 0, 48);
+    return MineCondInit((MineCond*)c, a);
+}
+static int stub_pthread_cond_wait(void* c, void* m)
+{
+    if (!c || !m) return 22;
+    MineCond* cc = (MineCond*)c;
+    if (!cc->cv) MineCondInit(cc, NULL);
+    MineMutex* mm = (MineMutex*)m;
+    if (!mm->cs) MineMutexInit(mm, NULL);
+    return MineCondWait(cc, mm);
+}
+static int stub_pthread_cond_timedwait(void* c, void* m, void* abstime)
+{
+    if (!c || !m) return 22;
+    MineCond* cc = (MineCond*)c;
+    if (!cc->cv) MineCondInit(cc, NULL);
+    MineMutex* mm = (MineMutex*)m;
+    if (!mm->cs) MineMutexInit(mm, NULL);
+    return MineCondTimedwait(cc, mm, abstime);
+}
+static int stub_pthread_cond_signal(void* c)
+{
+    if (!c) return 22;
+    MineCond* cc = (MineCond*)c;
+    if (!cc->cv) return 0;
+    return MineCondSignal(cc);
+}
+static int stub_pthread_cond_broadcast(void* c)
+{
+    if (!c) return 22;
+    MineCond* cc = (MineCond*)c;
+    if (!cc->cv) return 0;
+    return MineCondBroadcast(cc);
+}
+static int stub_pthread_cond_destroy(void* c)
+{
+    if (!c) return 0;
+    return MineCondDestroy((MineCond*)c);
+}
+
+static int stub_pthread_rwlock_init(void* rw, void* a)
+{
+    if (!rw) return 22;
+    memset(rw, 0, 56);
+    return MineRWLockInit((MineRWLock*)rw, a);
+}
+static int stub_pthread_rwlock_rdlock(void* rw)
+{
+    if (!rw) return 22;
+    MineRWLock* r = (MineRWLock*)rw;
+    if (!r->srw) MineRWLockInit(r, NULL);
+    return MineRWLockRdlock(r);
+}
+static int stub_pthread_rwlock_wrlock(void* rw)
+{
+    if (!rw) return 22;
+    MineRWLock* r = (MineRWLock*)rw;
+    if (!r->srw) MineRWLockInit(r, NULL);
+    return MineRWLockWrlock(r);
+}
+static int stub_pthread_rwlock_unlock(void* rw)
+{
+    if (!rw) return 22;
+    MineRWLock* r = (MineRWLock*)rw;
+    if (!r->srw) return 0;
+    return MineRWLockUnlock(r);
+}
+static int stub_pthread_rwlock_destroy(void* rw)
+{
+    if (!rw) return 0;
+    return MineRWLockDestroy((MineRWLock*)rw);
+}
+
+static int stub_pthread_key_create(void* k, void* d)
+{
+    if (!k) return 22;
+    uint32_t key = MineTlsCreate((void(*)(void*))d);
+    if (key == (uint32_t)-1) return 11;
+    *(uint32_t*)k = key;
+    return 0;
+}
+static void* stub_pthread_getspecific(void* k)
+{
+    return MineTlsGet((uint32_t)(uintptr_t)k);
+}
+static int stub_pthread_setspecific(void* k, void* v)
+{
+    return MineTlsSet((uint32_t)(uintptr_t)k, v);
+}
+static int stub_pthread_once(void* o, void* fn)
+{
+    if (!o || !fn) return 22;
+    return MineOnce(o, (void(*)(void))fn);
+}
 static void* stub_pthread_self(void) { return (void*)(uintptr_t)GetCurrentThreadId(); }
 static int   stub_pthread_atfork(void* p, void* c1, void* c2) { (void)p; (void)c1; (void)c2; return 0; }
 static void  stub_pthread_exit(void* r) { (void)r; ExitThread(0); }
-static int   stub_sem_init(void* s, int p, unsigned v) { (void)s; (void)p; (void)v; return 0; }
-static int   stub_sem_wait(void* s) { (void)s; return 0; }
-static int   stub_sem_post(void* s) { (void)s; return 0; }
-static int   stub_sem_destroy(void* s) { (void)s; return 0; }
+static int   stub_pthread_equal(void* t1, void* t2) { return t1 == t2; }
+
+/* Semaphores backed by Windows semaphore objects */
+static int stub_sem_init(void* s, int p, unsigned v)
+{
+    (void)p;
+    if (!s) return 22;
+    HANDLE h = CreateSemaphoreA(NULL, (LONG)v, 0x7FFFFFFF, NULL);
+    if (!h) return 12;
+    *(HANDLE*)s = h;
+    return 0;
+}
+static int stub_sem_wait(void* s)
+{
+    if (!s || !*(HANDLE*)s) return 22;
+    WaitForSingleObject(*(HANDLE*)s, INFINITE);
+    return 0;
+}
+static int stub_sem_post(void* s)
+{
+    if (!s || !*(HANDLE*)s) return 22;
+    ReleaseSemaphore(*(HANDLE*)s, 1, NULL);
+    return 0;
+}
+static int stub_sem_destroy(void* s)
+{
+    if (!s || !*(HANDLE*)s) return 0;
+    CloseHandle(*(HANDLE*)s);
+    *(HANDLE*)s = NULL;
+    return 0;
+}
 static void  stub_qsort_w(void* b, size_t n, size_t s, int(*c)(const void*, const void*))
 {
     qsort(b, n, s, c);
@@ -1167,14 +1391,73 @@ static char* stub_ttyname(int fd) { (void)fd; return NULL; }
 static int   stub_isatty_w(int fd) { return fd <= 2 ? 1 : 0; }
 static int   stub_tcgetattr(int fd, void* t) { (void)fd; (void)t; return -1; }
 static int   stub_tcsetattr(int fd, int a, void* t) { (void)fd; (void)a; (void)t; return -1; }
-static int   stub_ioctl_w(int fd, unsigned long r, ...) { (void)fd; (void)r; return 0; }
-static int   stub_fcntl(int fd, int cmd, ...) { (void)fd; (void)cmd; return 0; }
-static int   stub_epoll_create(int s) { (void)s; return -1; }
-static int   stub_epoll_ctl(int e, int o, int f, void* v) { (void)e; (void)o; (void)f; (void)v; return -1; }
-static int   stub_epoll_wait(int e, void* v, int m, int t) { (void)e; (void)v; (void)m; if (t > 0)Sleep((DWORD)t); return 0; }
-static int   stub_eventfd(unsigned v, int f) { (void)v; (void)f; return -1; }
+static int   stub_ioctl_w(int fd, unsigned long r, ...)
+{
+    if (r == 0x5413) { /* TIOCGWINSZ */
+        va_list ap; va_start(ap, r);
+        void* ws = va_arg(ap, void*);
+        va_end(ap);
+        if (!ws) return -1;
+        HANDLE h = fd_handle(fd);
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        uint16_t cols = 80, rows = 24;
+        if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &csbi)) {
+            cols = (uint16_t)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+            rows = (uint16_t)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+        }
+        memset(ws, 0, 8);
+        ((uint16_t*)ws)[0] = rows;
+        ((uint16_t*)ws)[1] = cols;
+        return 0;
+    }
+    (void)fd;
+    return 0;
+}
+static int stub_fcntl(int fd, int cmd, ...)
+{
+    va_list ap;
+    switch (cmd) {
+    case 0: /* F_DUPFD */
+    case 1030: /* F_DUPFD_CLOEXEC */
+        return _dup(fd);
+    case 1: /* F_GETFD */ return 0;
+    case 2: /* F_SETFD */ return 0;
+    case 3: /* F_GETFL */ return 0;
+    case 4: { /* F_SETFL */
+        va_start(ap, cmd);
+        int flags = va_arg(ap, int);
+        va_end(ap);
+        if (flags & 0x800) { /* O_NONBLOCK */
+            SOCKET s = (SOCKET)_get_osfhandle(fd);
+            if (s != (SOCKET)INVALID_HANDLE_VALUE) {
+                u_long mode = 1;
+                ioctlsocket(s, FIONBIO, &mode);
+            }
+        }
+        return 0;
+    }
+    default: return 0;
+    }
+}
+static int stub_epoll_create(int s) { return (int)MineEpollCreate(s); }
+static int stub_epoll_ctl(int e, int o, int f, void* v) { return (int)MineEpollCtl(e, o, f, v); }
+static int stub_epoll_wait(int e, void* v, int m, int t) { return (int)MineEpollWait(e, v, m, t); }
+static int stub_eventfd(unsigned v, int f)
+{
+    (void)f;
+    int fds[2];
+    if (MineVFSPipe(fds, 0) < 0) return -1;
+    if (v > 0) {
+        uint8_t one = 1;
+        DWORD w = 0;
+        WriteFile(fd_handle(fds[1]), &one, 1, &w, NULL);
+    }
+    return fds[0];
+}
 static int   stub_signalfd(int f, void* m, int fl) { (void)f; (void)m; (void)fl; return -1; }
-static int   stub_timerfd_create(int c, int f) { (void)c; (void)f; return -1; }
+static int stub_timerfd_create(int c, int f) { return (int)MineTimerfdCreate(c, f); }
+static int stub_timerfd_settime(int fd, int flags, void* nv, void* ov) { return (int)MineTimerfdSettime(fd, flags, nv, ov); }
+static int stub_timerfd_gettime(int fd, void* ov) { return (int)MineTimerfdGettime(fd, ov); }
 static int   stub_inotify_init(void) { return -1; }
 static int   stub_fallocate(int f, int m, int64_t o, int64_t l) { (void)f; (void)m; (void)o; (void)l; return -1; }
 static int   stub_posix_memalign(void** p, size_t a, size_t s)
@@ -1189,7 +1472,7 @@ static int   stub_sysinfo(void* i)
     typedef struct { long up; unsigned long load[3], totalram, freeram, pad[8]; unsigned short procs; }sysinfo_t;
     sysinfo_t* s = (sysinfo_t*)i; if (!s) return -1;
     MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms); GlobalMemoryStatusEx(&ms);
-    s->totalram = ms.ullTotalPhys; s->freeram = ms.ullAvailPhys; s->procs = 1;
+    s->totalram = (unsigned long)(ms.ullTotalPhys / 1024); s->freeram = (unsigned long)(ms.ullAvailPhys / 1024); s->procs = 1;
     s->up = (long)(GetTickCount64() / 1000); return 0;
 }
 static int   stub_setenv(const char* n, const char* v, int ov)
@@ -1200,11 +1483,30 @@ static int   stub_unsetenv(const char* n) { return _putenv_s(n, ""); }
 static void  stub_clearenv(void) {}
 static int   stub_putenv(char* s) { return _putenv(s); }
 static char** stub_environ_ptr(void) { return _environ; }
-static int   stub_raise_w(int s) { (void)s; return 0; }
-static int   stub_sigfillset(void* s) { if (s) memset(s, 0xFF, 8); return 0; }
-static int   stub_sigaddset(void* s, int n) { (void)s; (void)n; return 0; }
-static int   stub_sigdelset(void* s, int n) { (void)s; (void)n; return 0; }
-static int   stub_sigismember(void* s, int n) { (void)s; (void)n; return 0; }
+static int   stub_raise_w(int s) { MineSignalRaise(s); return 0; }
+static int   stub_sigfillset(void* s) { if (s) memset(s, 0xFF, 16); return 0; }
+static int   stub_sigaddset(void* s, int n) {
+    if (s && n >= 1 && n <= 128) {
+        int idx = (n - 1) / 64;
+        int bit = (n - 1) % 64;
+        ((uint64_t*)s)[idx] |= (1ULL << bit);
+    }
+    return 0;
+}
+static int   stub_sigdelset(void* s, int n) {
+    if (s && n >= 1 && n <= 128) {
+        int idx = (n - 1) / 64;
+        int bit = (n - 1) % 64;
+        ((uint64_t*)s)[idx] &= ~(1ULL << bit);
+    }
+    return 0;
+}
+static int   stub_sigismember(void* s, int n) {
+    if (!s || n < 1 || n > 128) return 0;
+    int idx = (n - 1) / 64;
+    int bit = (n - 1) % 64;
+    return (((uint64_t*)s)[idx] >> bit) & 1;
+}
 static int   stub_sigwait(void* s, int* n) { (void)s; if (n)*n = 0; return 0; }
 static int   stub_clone(void* fn, void* s, int f, void* a) { (void)fn; (void)s; (void)f; (void)a; return -1; }
 static int   stub_capget(void* h, void* d) { (void)h; (void)d; return 0; }
@@ -1476,6 +1778,448 @@ static int stub_register_atfork(void* p, void* c, void* a, void* d)
     (void)p; (void)c; (void)a; (void)d; return 0;
 }
 
+/* ─── writev ──────────────────────────────────────────────────────────────── */
+static int64_t stub_writev(int fd, const dyn_iovec* iov, int iovcnt)
+{
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        int w = stub_write_fd(fd, iov[i].iov_base, iov[i].iov_len);
+        if (w < 0) return total ? total : -1;
+        total += w;
+    }
+    return total;
+}
+
+/* ─── ppoll / pselect ─────────────────────────────────────────────────────── */
+static int stub_ppoll(void* fds, unsigned n, void* ts, void* sigmask)
+{
+    int timeout = -1;
+    if (ts) {
+        typedef struct { int64_t tv_sec; int64_t tv_nsec; } Lts;
+        Lts* t = (Lts*)ts;
+        timeout = (int)(t->tv_sec * 1000 + t->tv_nsec / 1000000);
+    }
+    (void)sigmask;
+    return (int)MinePoll(fds, n, timeout);
+}
+
+static int stub_pselect(int n, void* r, void* w, void* e, void* ts, void* sigmask)
+{
+    (void)sigmask;
+    void* tv = NULL;
+    typedef struct { int64_t tv_sec; int64_t tv_usec; } Ltv;
+    Ltv ltv;
+    if (ts) {
+        typedef struct { int64_t tv_sec; int64_t tv_nsec; } Lts;
+        Lts* t = (Lts*)ts;
+        ltv.tv_sec = t->tv_sec;
+        ltv.tv_usec = t->tv_nsec / 1000;
+        tv = &ltv;
+    }
+    return (int)MineSelect(n, r, w, e, tv);
+}
+
+/* ─── pipe2 ───────────────────────────────────────────────────────────────── */
+static int stub_pipe2(int* fds, int flags) { (void)flags; return (int)MineVFSPipe(fds, 0); }
+
+/* ─── getpwuid_r ──────────────────────────────────────────────────────────── */
+static int stub_getpwuid_r(unsigned uid, void* pwd, char* buf, size_t bufsz, void** result)
+{
+    (void)uid; (void)buf; (void)bufsz;
+    if (pwd) memset(pwd, 0, 56);
+    if (result) *result = NULL;
+    return 0;
+}
+
+/* ─── sendfile ────────────────────────────────────────────────────────────── */
+static int64_t stub_sendfile(int out_fd, int in_fd, void* offset, size_t count)
+{
+    char buf[8192];
+    if (offset) {
+        int64_t off = *(int64_t*)offset;
+        _lseeki64(in_fd, off, 0);
+    }
+    int64_t total = 0;
+    while ((size_t)total < count) {
+        size_t to_read = count - total;
+        if (to_read > sizeof(buf)) to_read = sizeof(buf);
+        DWORD got = 0;
+        ReadFile(fd_handle(in_fd), buf, (DWORD)to_read, &got, NULL);
+        if (got == 0) break;
+        int w = stub_write_fd(out_fd, buf, got);
+        if (w <= 0) break;
+        total += w;
+    }
+    if (offset) *(int64_t*)offset += total;
+    return total;
+}
+
+/* ─── signal helpers ──────────────────────────────────────────────────────── */
+static int stub_sigrtmin(void) { return 34; }
+static int stub_sigrtmax(void) { return 64; }
+
+/* ─── pthread attribute stubs ─────────────────────────────────────────────── */
+static int stub_pthread_attr_init(void* a) { if (a) memset(a, 0, 56); return 0; }
+static int stub_pthread_attr_setdetachstate(void* a, int s) { (void)a; (void)s; return 0; }
+static int stub_pthread_attr_setstacksize(void* a, size_t s) { (void)a; (void)s; return 0; }
+static int stub_pthread_setcancelstate(int s, int* o) { if (o) *o = 0; (void)s; return 0; }
+
+/* ─── confstr / pathconf ──────────────────────────────────────────────────── */
+static size_t stub_confstr(int name, char* buf, size_t len)
+{
+    (void)name;
+    const char* val = "/usr/bin:/bin";
+    size_t vlen = strlen(val) + 1;
+    if (buf && len > 0) { strncpy(buf, val, len); buf[len - 1] = 0; }
+    return vlen;
+}
+
+static long stub_pathconf(int fd_or_path, int name)
+{
+    (void)fd_or_path;
+    switch (name) {
+    case 1: return 255;  /* NAME_MAX */
+    case 2: return 4096; /* PATH_MAX */
+    case 6: return 1;    /* _PC_LINK_MAX -- not a real link but ok */
+    default: return -1;
+    }
+}
+
+/* ─── statvfs / fstatvfs ──────────────────────────────────────────────────── */
+#pragma pack(push,1)
+typedef struct {
+    uint64_t f_bsize, f_frsize;
+    uint64_t f_blocks, f_bfree, f_bavail;
+    uint64_t f_files, f_ffree, f_favail;
+    uint64_t f_fsid, f_flag, f_namemax;
+    int32_t  __spare[6];
+} Linux_statvfs;
+#pragma pack(pop)
+
+static int stub_statvfs(const char* path, void* buf)
+{
+    if (!buf) return -1;
+    Linux_statvfs* sv = (Linux_statvfs*)buf;
+    memset(sv, 0, sizeof(*sv));
+    sv->f_bsize = 4096;
+    sv->f_frsize = 4096;
+    sv->f_namemax = 255;
+
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    const char* use = wp ? wp : path;
+
+    char root[4] = "C:\\";
+    if (use && use[0] && use[1] == ':') { root[0] = use[0]; }
+    ULARGE_INTEGER avail, total, free_bytes;
+    if (GetDiskFreeSpaceExA(root, &avail, &total, &free_bytes)) {
+        sv->f_blocks = total.QuadPart / 4096;
+        sv->f_bfree = free_bytes.QuadPart / 4096;
+        sv->f_bavail = avail.QuadPart / 4096;
+    }
+    sv->f_files = 1000000;
+    sv->f_ffree = 500000;
+    sv->f_favail = 500000;
+    return 0;
+}
+
+static int stub_fstatvfs(int fd, void* buf)
+{
+    (void)fd;
+    return stub_statvfs("C:\\", buf);
+}
+
+/* ─── I/O extras ──────────────────────────────────────────────────────────── */
+static int stub_fgetc(void* f)
+{
+    if (!f) return -1;
+    if (f == mine_stdin) return fgetc(stdin);
+    if (f == mine_stdout || f == mine_stderr) return -1;
+    return fgetc((FILE*)f);
+}
+
+static int stub_getc(void* f) { return stub_fgetc(f); }
+
+static int stub_getchar(void) { return fgetc(stdin); }
+
+static int stub_ungetc(int c, void* f)
+{
+    if (!f) return -1;
+    if (f == mine_stdin) return ungetc(c, stdin);
+    if (f == mine_stdout || f == mine_stderr) return -1;
+    return ungetc(c, (FILE*)f);
+}
+
+static int stub_setvbuf(void* f, char* buf, int mode, size_t size)
+{
+    (void)f; (void)buf; (void)mode; (void)size;
+    return 0;
+}
+
+static int64_t stub_getline(char** lineptr, size_t* n, void* f)
+{
+    if (!lineptr || !n || !f) return -1;
+    FILE* fp = NULL;
+    if (f == mine_stdin) fp = stdin;
+    else if (f == mine_stdout || f == mine_stderr) return -1;
+    else fp = (FILE*)f;
+
+    size_t cap = *n;
+    if (!*lineptr || cap == 0) { cap = 128; *lineptr = (char*)malloc(cap); if (!*lineptr) return -1; }
+
+    size_t pos = 0;
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (pos + 2 > cap) { cap *= 2; char* t = (char*)realloc(*lineptr, cap); if (!t) return -1; *lineptr = t; }
+        (*lineptr)[pos++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (pos == 0 && c == EOF) return -1;
+    (*lineptr)[pos] = 0;
+    *n = cap;
+    return (int64_t)pos;
+}
+
+static int64_t stub_getdelim(char** lineptr, size_t* n, int delim, void* f)
+{
+    if (!lineptr || !n || !f) return -1;
+    FILE* fp = (f == mine_stdin) ? stdin : (FILE*)f;
+    size_t cap = *n;
+    if (!*lineptr || cap == 0) { cap = 128; *lineptr = (char*)malloc(cap); if (!*lineptr) return -1; }
+    size_t pos = 0;
+    int c;
+    while ((c = fgetc(fp)) != EOF) {
+        if (pos + 2 > cap) { cap *= 2; char* t = (char*)realloc(*lineptr, cap); if (!t) return -1; *lineptr = t; }
+        (*lineptr)[pos++] = (char)c;
+        if (c == delim) break;
+    }
+    if (pos == 0) return -1;
+    (*lineptr)[pos] = 0;
+    *n = cap;
+    return (int64_t)pos;
+}
+
+static char* stub_strerror_r(int err, char* buf, size_t buflen)
+{
+    const char* msg = strerror(err);
+    if (buf && buflen > 0) { strncpy(buf, msg, buflen); buf[buflen - 1] = 0; }
+    return buf;
+}
+
+static void* stub_tmpfile(void)
+{
+    return tmpfile();
+}
+
+static char* stub_tmpnam(char* s)
+{
+    static char buf[MAX_PATH];
+    char tpath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tpath);
+    GetTempFileNameA(tpath, "mine", 0, buf);
+    if (s) { strcpy(s, buf); return s; }
+    return buf;
+}
+
+static int stub_mkstemp(char* tmpl)
+{
+    if (!tmpl) return -1;
+    char* suffix = tmpl + strlen(tmpl) - 6;
+    for (int i = 0; i < 6; i++) {
+        if (suffix[i] != 'X') return -1;
+    }
+    for (int attempt = 0; attempt < 1000; attempt++) {
+        for (int i = 0; i < 6; i++)
+            suffix[i] = "abcdefghijklmnopqrstuvwxyz0123456789"[rand() % 36];
+        int fd = _open(tmpl, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY, 0600);
+        if (fd >= 0) return fd;
+    }
+    return -1;
+}
+
+static char* stub_mkdtemp(char* tmpl)
+{
+    if (!tmpl) return NULL;
+    char* suffix = tmpl + strlen(tmpl) - 6;
+    for (int attempt = 0; attempt < 1000; attempt++) {
+        for (int i = 0; i < 6; i++)
+            suffix[i] = "abcdefghijklmnopqrstuvwxyz0123456789"[rand() % 36];
+        if (_mkdir(tmpl) == 0) return tmpl;
+    }
+    return NULL;
+}
+
+static int stub_remove(const char* p) { return remove(p); }
+
+static int stub_fdatasync(int fd) { (void)fd; return 0; }
+static int stub_fsync(int fd) { (void)fd; return 0; }
+
+static size_t stub_mbsrtowcs(wchar_t* dest, const char** src, size_t len, void* ps)
+{
+    (void)ps;
+    if (!src || !*src) return 0;
+    return mbstowcs(dest, *src, len);
+}
+
+static size_t stub_wcsrtombs(char* dest, const wchar_t** src, size_t len, void* ps)
+{
+    (void)ps;
+    if (!src || !*src) return 0;
+    return wcstombs(dest, *src, len);
+}
+
+static int stub_wctomb(char* s, wchar_t wc)
+{
+    return wctomb(s, wc);
+}
+
+static int stub_mbtowc(wchar_t* pwc, const char* s, size_t n)
+{
+    return mbtowc(pwc, s, n);
+}
+
+static size_t stub_mbrtowc(wchar_t* pwc, const char* s, size_t n, void* ps)
+{
+    (void)ps;
+    if (!s) return 0;
+    return mbtowc(pwc, s, n);
+}
+
+static int stub_wcwidth(unsigned wc) { return (wc >= 0x20 && wc != 0x7F) ? 1 : 0; }
+
+static wchar_t* stub_wmemcpy(wchar_t* d, const wchar_t* s, size_t n) { return (wchar_t*)memcpy(d, s, n * sizeof(wchar_t)); }
+static wchar_t* stub_wmemset(wchar_t* d, wchar_t c, size_t n) { for (size_t i = 0; i < n; i++) d[i] = c; return d; }
+
+/* ─── locale / nl_langinfo ────────────────────────────────────────────────── */
+static char* stub_nl_langinfo_real(int item)
+{
+    switch (item) {
+    case 14: return (char*)"UTF-8";  /* CODESET */
+    case 1: return (char*)"%a %b %e %H:%M:%S %Y"; /* D_T_FMT */
+    case 2: return (char*)"%m/%d/%y"; /* D_FMT */
+    case 3: return (char*)"%H:%M:%S"; /* T_FMT */
+    default: return (char*)"";
+    }
+}
+
+/* ─── FTS file tree walk (used by coreutils rm, chmod, chown) ─────────────── */
+typedef struct fts_s {
+    HANDLE hFind;
+    char basepath[MAX_PATH];
+    int state;
+} MineFTS;
+
+typedef struct ftsent_s {
+    uint16_t fts_info;
+    char* fts_path;
+    char* fts_name;
+    int64_t fts_statp_placeholder;
+} MineFTSENT;
+
+#define FTS_F     8
+#define FTS_D     1
+#define FTS_DP    6
+
+static MineFTS* stub_fts_open(char** argv, int options, void* compar)
+{
+    (void)options; (void)compar;
+    if (!argv || !argv[0]) return NULL;
+    MineFTS* fts = (MineFTS*)calloc(1, sizeof(MineFTS));
+    if (!fts) return NULL;
+    strncpy(fts->basepath, argv[0], MAX_PATH - 1);
+    fts->state = 0;
+    return fts;
+}
+
+static MineFTSENT g_ftsent;
+static char g_ftsent_path[MAX_PATH];
+static char g_ftsent_name[256];
+
+static MineFTSENT* stub_fts_read(MineFTS* fts)
+{
+    if (!fts) return NULL;
+    if (fts->state > 0) return NULL;
+    fts->state = 1;
+    strncpy(g_ftsent_path, fts->basepath, MAX_PATH - 1);
+    const char* base = fts->basepath;
+    for (const char* p = fts->basepath; *p; p++)
+        if (*p == '/' || *p == '\\') base = p + 1;
+    strncpy(g_ftsent_name, base, 255);
+    g_ftsent.fts_path = g_ftsent_path;
+    g_ftsent.fts_name = g_ftsent_name;
+    DWORD attr = GetFileAttributesA(fts->basepath);
+    g_ftsent.fts_info = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) ? FTS_D : FTS_F;
+    return &g_ftsent;
+}
+
+static int stub_fts_close(MineFTS* fts)
+{
+    if (fts) free(fts);
+    return 0;
+}
+
+static int stub_fts_set(MineFTS* fts, MineFTSENT* ent, int instr)
+{
+    (void)fts; (void)ent; (void)instr; return 0;
+}
+
+/* ─── nftw / ftw ──────────────────────────────────────────────────────────── */
+static int stub_nftw(const char* path, void* fn, int fd_limit, int flags)
+{
+    (void)path; (void)fn; (void)fd_limit; (void)flags; return -1;
+}
+
+/* ─── regex ───────────────────────────────────────────────────────────────── */
+static int stub_regcomp(void* preg, const char* regex, int cflags)
+{
+    (void)preg; (void)regex; (void)cflags; return -1;
+}
+static int stub_regexec(const void* preg, const char* string, size_t nmatch, void* pmatch, int eflags)
+{
+    (void)preg; (void)string; (void)nmatch; (void)pmatch; (void)eflags; return -1;
+}
+static void stub_regfree(void* preg) { (void)preg; }
+static size_t stub_regerror(int errcode, const void* preg, char* errbuf, size_t errbuf_size)
+{
+    (void)errcode; (void)preg;
+    if (errbuf && errbuf_size > 0) { strncpy(errbuf, "regex error", errbuf_size); errbuf[errbuf_size - 1] = 0; }
+    return 12;
+}
+
+/* ─── fnmatch / glob ──────────────────────────────────────────────────────── */
+static int stub_fnmatch(const char* pattern, const char* string, int flags)
+{
+    (void)flags;
+    if (!pattern || !string) return -1;
+    if (strcmp(pattern, "*") == 0) return 0;
+    if (strcmp(pattern, string) == 0) return 0;
+    return 1; /* FNM_NOMATCH */
+}
+
+/* ─── clearerr / fileno_unlocked ──────────────────────────────────────────── */
+static void stub_clearerr(void* f) { (void)f; }
+static int stub_fileno_unlocked(void* f) { return file_fd(f); }
+static int stub_fclose2(void* f)
+{
+    if (!f || f == mine_stdin || f == mine_stdout || f == mine_stderr) return 0;
+    return fclose((FILE*)f);
+}
+static void stub_flockfile(void* f) { (void)f; }
+static void stub_funlockfile(void* f) { (void)f; }
+static int stub_ftrylockfile(void* f) { (void)f; return 0; }
+
+/* ─── locale ──────────────────────────────────────────────────────────────── */
+static void* stub_newlocale(int mask, const char* locale, void* base)
+{
+    (void)mask; (void)locale; (void)base;
+    static int dummy_locale = 1;
+    return &dummy_locale;
+}
+static void stub_freelocale(void* loc) { (void)loc; }
+static void* stub_uselocale(void* loc) { (void)loc; static int d = 1; return &d; }
+static int stub_strcoll(const char* a, const char* b) { return strcmp(a, b); }
+static size_t stub_strxfrm(char* d, const char* s, size_t n) { return strncpy(d, s, n) ? strlen(s) : 0; }
+
 static int stub_dl_iterate_phdr(void* cb, void* data)
 {
     (void)cb; (void)data; return 0;
@@ -1673,7 +2417,7 @@ static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
 
 /* ─── stub table ──────────────────────────────────────────────────────────── */
 typedef struct { const char* name; void(*fn)(void); } SymStub;
-#define MAX_STUBS 450
+#define MAX_STUBS 600
 static SymStub s_stubs[MAX_STUBS];
 
 static void init_stubs(void)
@@ -1886,6 +2630,8 @@ static void init_stubs(void)
     S("fork", stub_fork);
     S("waitpid", stub_waitpid);
     S("execve", stub_execve);
+    S("execvp", stub_execvp);
+    S("execv", stub_execvp);
     S("system", stub_system);
     S("pipe", stub_pipe);
     S("dup", stub_dup);
@@ -1974,6 +2720,20 @@ static void init_stubs(void)
     S("pthread_mutex_lock", stub_pthread_mutex_lock);
     S("pthread_mutex_unlock", stub_pthread_mutex_unlock);
     S("pthread_mutex_destroy", stub_pthread_mutex_destroy);
+    S("pthread_mutex_trylock", stub_pthread_mutex_trylock);
+    S("pthread_detach", stub_pthread_detach);
+    S("pthread_equal", stub_pthread_equal);
+    S("pthread_cond_init", stub_pthread_cond_init);
+    S("pthread_cond_wait", stub_pthread_cond_wait);
+    S("pthread_cond_timedwait", stub_pthread_cond_timedwait);
+    S("pthread_cond_signal", stub_pthread_cond_signal);
+    S("pthread_cond_broadcast", stub_pthread_cond_broadcast);
+    S("pthread_cond_destroy", stub_pthread_cond_destroy);
+    S("pthread_rwlock_init", stub_pthread_rwlock_init);
+    S("pthread_rwlock_rdlock", stub_pthread_rwlock_rdlock);
+    S("pthread_rwlock_wrlock", stub_pthread_rwlock_wrlock);
+    S("pthread_rwlock_unlock", stub_pthread_rwlock_unlock);
+    S("pthread_rwlock_destroy", stub_pthread_rwlock_destroy);
     S("pthread_key_create", stub_pthread_key_create);
     S("pthread_getspecific", stub_pthread_getspecific);
     S("pthread_setspecific", stub_pthread_setspecific);
@@ -2003,6 +2763,8 @@ static void init_stubs(void)
     S("eventfd", stub_eventfd);
     S("signalfd", stub_signalfd);
     S("timerfd_create", stub_timerfd_create);
+    S("timerfd_settime", stub_timerfd_settime);
+    S("timerfd_gettime", stub_timerfd_gettime);
     S("inotify_init", stub_inotify_init);
     S("inotify_init1", stub_inotify_init);
     S("fallocate", stub_fallocate);
@@ -2080,6 +2842,125 @@ static void init_stubs(void)
     S("dl_iterate_phdr", stub_dl_iterate_phdr);
     S("__tls_get_addr", stub_tls_get_addr);
     S("__vsnprintf_chk", stub_vsnprintf_chk);
+    /* additional POSIX */
+    S("writev", stub_writev);
+    S("pread", stub_pread64);
+    S("pwrite", stub_pwrite64);
+    S("ppoll", stub_ppoll);
+    S("pselect", stub_pselect);
+    S("accept4", stub_accept);
+    S("pipe2", stub_pipe2);
+    S("getpwuid_r", stub_getpwuid_r);
+    S("mmap64", stub_mmap);
+    S("lseek64", stub_lseek64);
+    S("fopen64", stub_fopen);
+    S("ftruncate64", stub_ftruncate);
+    S("truncate64", stub_truncate);
+    S("stat64", stub_stat64);
+    S("fstat64", stub_fstat64);
+    S("lstat64", stub_lstat_fn);
+    S("sendfile", stub_sendfile);
+    S("sendfile64", stub_sendfile);
+    S("eventfd", stub_eventfd);
+    S("dup3", stub_dup2);
+    S("__libc_current_sigrtmin", stub_sigrtmin);
+    S("__libc_current_sigrtmax", stub_sigrtmax);
+    S("pthread_sigmask", stub_sigprocmask);
+    S("pthread_attr_init", stub_pthread_attr_init);
+    S("pthread_attr_destroy", stub_pthread_attr_init);
+    S("pthread_attr_setdetachstate", stub_pthread_attr_setdetachstate);
+    S("pthread_attr_setstacksize", stub_pthread_attr_setstacksize);
+    S("pthread_mutexattr_init", stub_noop);
+    S("pthread_mutexattr_settype", stub_noop);
+    S("pthread_mutexattr_destroy", stub_noop);
+    S("pthread_condattr_init", stub_noop);
+    S("pthread_condattr_setclock", stub_noop);
+    S("pthread_condattr_destroy", stub_noop);
+    S("pthread_key_delete", stub_noop);
+    S("pthread_setname_np", stub_noop);
+    S("pthread_getattr_np", stub_noop);
+    S("pthread_cancel", stub_noop);
+    S("pthread_setcancelstate", stub_pthread_setcancelstate);
+    S("pthread_setcanceltype", stub_pthread_setcancelstate);
+    S("confstr", stub_confstr);
+    S("pathconf", stub_pathconf);
+    S("fpathconf", stub_pathconf);
+    S("statvfs", stub_statvfs);
+    S("fstatvfs", stub_fstatvfs);
+    /* I/O extras */
+    S("fgetc", stub_fgetc);
+    S("getc", stub_getc);
+    S("getchar", stub_getchar);
+    S("ungetc", stub_ungetc);
+    S("setvbuf", stub_setvbuf);
+    S("getline", stub_getline);
+    S("__getdelim", stub_getdelim);
+    S("getdelim", stub_getdelim);
+    S("strerror_r", stub_strerror_r);
+    S("__xpg_strerror_r", stub_strerror_r);
+    S("tmpfile", stub_tmpfile);
+    S("tmpfile64", stub_tmpfile);
+    S("tmpnam", stub_tmpnam);
+    S("mkstemp", stub_mkstemp);
+    S("mkstemp64", stub_mkstemp);
+    S("mkdtemp", stub_mkdtemp);
+    S("remove", stub_remove);
+    S("fdatasync", stub_fdatasync);
+    S("fsync", stub_fsync);
+    S("mbsrtowcs", stub_mbsrtowcs);
+    S("wcsrtombs", stub_wcsrtombs);
+    S("wctomb", stub_wctomb);
+    S("mbtowc", stub_mbtowc);
+    S("mbrtowc", stub_mbrtowc);
+    S("wcwidth", stub_wcwidth);
+    S("wcslen", wcslen);
+    S("wmemcpy", stub_wmemcpy);
+    S("wmemset", stub_wmemset);
+    S("wcscmp", wcscmp);
+    S("wcsncmp", wcsncmp);
+    S("wcschr", wcschr);
+    S("wcsrchr", wcsrchr);
+    /* setjmp */
+    S("__sigsetjmp", stub_setjmp);
+    S("sigsetjmp", stub_setjmp);
+    S("siglongjmp", stub_longjmp_w);
+    S("__longjmp", stub_longjmp_w);
+    /* locale */
+    S("nl_langinfo", stub_nl_langinfo_real);
+    S("newlocale", stub_newlocale);
+    S("freelocale", stub_freelocale);
+    S("uselocale", stub_uselocale);
+    S("strcoll", stub_strcoll);
+    S("strxfrm", stub_strxfrm);
+    /* FTS file tree walk */
+    S("fts_open", stub_fts_open);
+    S("fts_read", stub_fts_read);
+    S("fts_close", stub_fts_close);
+    S("fts_set", stub_fts_set);
+    S("nftw", stub_nftw);
+    S("nftw64", stub_nftw);
+    /* regex */
+    S("regcomp", stub_regcomp);
+    S("regexec", stub_regexec);
+    S("regfree", stub_regfree);
+    S("regerror", stub_regerror);
+    S("fnmatch", stub_fnmatch);
+    /* file locking */
+    S("clearerr", stub_clearerr);
+    S("fileno_unlocked", stub_fileno_unlocked);
+    S("flockfile", stub_flockfile);
+    S("funlockfile", stub_funlockfile);
+    S("ftrylockfile", stub_ftrylockfile);
+    S("fclose", stub_fclose2);
+    /* extra I/O */
+    S("getline", stub_getline);
+    S("fgetc_unlocked", stub_fgetc);
+    S("getc_unlocked", stub_getc);
+    S("fgets_unlocked", stub_fgets);
+    S("fread_unlocked", stub_fread);
+    S("fwrite_unlocked", stub_fwrite);
+    S("feof_unlocked", stub_feof);
+    S("ferror_unlocked", stub_ferror);
 #undef S
     s_stubs[i].name = NULL;
     s_stubs[i].fn = NULL;
@@ -2088,11 +2969,13 @@ static void init_stubs(void)
 /* ─── symbol data table ───────────────────────────────────────────────────── */
 typedef struct { const char* name; void* data; size_t size; } SymData;
 
-/* __progname / __progname_full — used by uptime and other GNU tools */
+/* __progname / __progname_full / program_invocation_name — used by uptime, coreutils */
 static char* g_progname = (char*)"mine";
 static char* g_progname_full = (char*)"mine";
+static char* g_program_invocation_name = (char*)"mine";
+static char* g_program_invocation_short_name = (char*)"mine";
 
-#define SYM_DATA_COUNT 12
+#define SYM_DATA_COUNT 14
 static SymData s_data[SYM_DATA_COUNT];
 
 static void init_sym_data(void)
@@ -2108,6 +2991,8 @@ static void init_sym_data(void)
     s_data[i].name = "__progname";     s_data[i].data = &g_progname;       s_data[i].size = sizeof(char*); i++;
     s_data[i].name = "__progname_full"; s_data[i].data = &g_progname_full;  s_data[i].size = sizeof(char*); i++;
     s_data[i].name = "environ";        s_data[i].data = &g_envp;           s_data[i].size = sizeof(char**); i++;
+    s_data[i].name = "program_invocation_name";       s_data[i].data = &g_program_invocation_name;       s_data[i].size = sizeof(char*); i++;
+    s_data[i].name = "program_invocation_short_name"; s_data[i].data = &g_program_invocation_short_name; s_data[i].size = sizeof(char*); i++;
     s_data[i].name = NULL; s_data[i].data = NULL; s_data[i].size = 0;
 }
 

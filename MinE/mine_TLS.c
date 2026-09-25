@@ -163,6 +163,37 @@ bool MineTLSInit(const MineImage* img)
     return ok;
 }
 
+void MineTLSInitThread(void)
+{
+    uint64_t aligned_tls = g_tls_size;
+    uint64_t total = aligned_tls + sizeof(MineTCB);
+    void* alloc = VirtualAlloc(NULL, (SIZE_T)(total + 4096),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!alloc) return;
+    memset(alloc, 0, (size_t)total);
+
+    uint8_t* tls_block = (uint8_t*)alloc;
+    MineTCB* tcb = (MineTCB*)(tls_block + aligned_tls);
+
+    if (g_tls_block && aligned_tls > 0)
+        memcpy(tls_block, g_tls_block, (size_t)aligned_tls);
+
+    tcb->self = (uint64_t)(uintptr_t)tcb;
+
+    HCRYPTPROV cp = 0;
+    if (CryptAcquireContextA(&cp, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        CryptGenRandom(cp, 8, (BYTE*)&tcb->stack_guard);
+        CryptReleaseContext(cp, 0);
+    } else {
+        tcb->stack_guard = 0xDEADBEEFCAFEBABEULL;
+    }
+    tcb->ptr_guard = tcb->stack_guard ^ 0x5A5A5A5A5A5A5A5AULL;
+
+    uint64_t fs = (uint64_t)(uintptr_t)tcb;
+    try_wrfsbase(fs);
+    MineDynSetGuestFS(fs);
+}
+
 uint64_t MineTLSBase(void) { return g_fs_base; }
 uint8_t* MineTLSGetBlock(void) { return g_tls_block; }
 uint64_t MineTLSGetSize(void) { return g_tls_size; }

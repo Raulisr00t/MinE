@@ -11,6 +11,9 @@ extern "C" {
 
 	bool MineTLSInit(const MineImage* img);
 
+	/* Per-thread TLS setup for new threads (pthread_create) */
+	void MineTLSInitThread(void);
+
 	/* Returns the FS base we installed */
 	uint64_t MineTLSBase(void);
 

@@ -48,6 +48,21 @@
     <ClCompile Include="mine_TLS.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="mine_patch.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_vfs.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_signal.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_thread.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="mine_process.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="mine.h">
@@ -78,6 +93,21 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="mine_TLS.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_patch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_vfs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_signal.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_thread.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="mine_process.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

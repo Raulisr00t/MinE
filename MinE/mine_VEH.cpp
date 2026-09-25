@@ -1,5 +1,6 @@
 ﻿#include "mine_VEH.h"
 #include "mine_dynamic.h"
+#include "mine_signal.h"
 #include <Windows.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -96,6 +97,11 @@ static LONG WINAPI VEHHandler(EXCEPTION_POINTERS* ep)
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
 
+        if (MineSignalHasHandler(MINE_SIGSEGV)) {
+            MineSignalRaise(MINE_SIGSEGV);
+            MineSignalDeliver();
+        }
+
         fprintf(stderr, "\n[MinE] SIGSEGV \xe2\x80\x94 guest accessed 0x%016llX (%s)\n",
             (unsigned long long)er->ExceptionInformation[1],
             er->ExceptionInformation[0] ? "write" : "read");
@@ -104,6 +110,10 @@ static LONG WINAPI VEHHandler(EXCEPTION_POINTERS* ep)
     }
 
     if (er->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION) {
+        if (MineSignalHasHandler(MINE_SIGILL)) {
+            MineSignalRaise(MINE_SIGILL);
+            MineSignalDeliver();
+        }
         fprintf(stderr, "\n[MinE] SIGILL \xe2\x80\x94 illegal instruction at RIP=0x%016llX\n",
             (unsigned long long)ctx->Rip);
         report_crash(ep);
@@ -117,6 +127,10 @@ static LONG WINAPI VEHHandler(EXCEPTION_POINTERS* ep)
     }
 
     if (er->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO) {
+        if (MineSignalHasHandler(MINE_SIGFPE)) {
+            MineSignalRaise(MINE_SIGFPE);
+            MineSignalDeliver();
+        }
         fprintf(stderr, "\n[MinE] SIGFPE at RIP=0x%016llX\n",
             (unsigned long long)ctx->Rip);
         report_crash(ep);
