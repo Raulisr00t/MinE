@@ -202,7 +202,7 @@ void MineRun(LPCSTR path, int argc, const char* argv[])
     MinePatchSyscalls(&img);
 
     /* ── 2. Set up TLS / FS base (must be before DynLink calls DT_INIT) ── */
-    MineTLSInit();
+    MineTLSInit(&img);
 
     /* ── 3. Apply GOT/PLT relocations (dynamic linking) ── */
     if (!MineDynLink(path, &img)) {

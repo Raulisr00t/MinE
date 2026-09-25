@@ -24,6 +24,11 @@ extern "C" {
             uint64_t size;
         } exec_segs[MINE_MAX_EXEC_SEGS];
         int exec_seg_count;
+        /* PT_TLS template info */
+        uint64_t tls_vaddr;
+        uint64_t tls_filesz;
+        uint64_t tls_memsz;
+        uint64_t tls_align;
     } MineImage;
 
     bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out);

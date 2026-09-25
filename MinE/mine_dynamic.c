@@ -1554,15 +1554,17 @@ static const char* stub_procps_uptime_sprint_short(void)
 }
 
 /* ─── TLS for dynamic binaries ─────────────────────────────────────────── */
-#define MINE_TLS_BLOCK_SIZE  4096
-static uint8_t  g_tls_block[MINE_TLS_BLOCK_SIZE];
+#include "mine_tls.h"
+
 static uint64_t g_dtv[3];
 
 static void mine_tls_init_dtv(void)
 {
-    memset(g_tls_block, 0, sizeof(g_tls_block));
+    uint8_t* tls_block = MineTLSGetBlock();
+    if (!tls_block) return;
+
     g_dtv[0] = 1;
-    g_dtv[1] = (uint64_t)(uintptr_t)g_tls_block;
+    g_dtv[1] = (uint64_t)(uintptr_t)tls_block;
     g_dtv[2] = 0;
     uint64_t fs = MineGetGuestFS();
     if (fs) {
@@ -1575,7 +1577,7 @@ static void* stub_tls_get_addr(void* ti_ptr)
 {
     uint64_t* ti = (uint64_t*)ti_ptr;
     uint64_t offset = ti[1];
-    return (void*)(g_tls_block + offset);
+    return (void*)(MineTLSGetBlock() + offset);
 }
 
 static int stub_vsnprintf_chk(char* s, size_t maxlen, int flag, size_t slen, const char* fmt, va_list ap)
@@ -1641,16 +1643,18 @@ static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
         restore_fs(win_fs);
     }
 
-    /* DT_INIT_ARRAY constructors are __attribute__((constructor)) functions.
-     * They take NO arguments (void fn(void)).
-     * Passing argc=2 in RDI caused crashes because some constructors
-     * treated RDI as a string pointer. Call with zero args. */
+    /* DT_INIT_ARRAY constructors: glibc's __libc_csu_init calls these with
+     * (argc, argv, envp). Rust's runtime init in INIT_ARRAY uses these args
+     * to save program arguments for std::env::args(). */
     for (int k = 0; k < g_init_array_count; k++) {
         uint64_t fn = g_init_array[k];
         if (fn && fn != (uint64_t)-1) {
             typedef int (*win_fn_t)(void*, uint64_t, uint64_t, uint64_t);
             __try {
-                ((win_fn_t)MineWinToLinux)((void*)(uintptr_t)fn, 0, 0, 0);
+                ((win_fn_t)MineWinToLinux)((void*)(uintptr_t)fn,
+                    (uint64_t)argc,
+                    (uint64_t)(uintptr_t)argv,
+                    (uint64_t)(uintptr_t)g_envp);
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {}
             g_saved_guest_fs = save_fs();

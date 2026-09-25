@@ -49,6 +49,7 @@ typedef struct {
 #define PT_LOAD   1
 #define PT_INTERP 3
 #define PT_PHDR   6
+#define PT_TLS    7
 #define PF_X      0x1
 #define PF_W     0x2
 #define PF_R     0x4
@@ -145,16 +146,16 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
     uint64_t phdr_vaddr = 0;
 
     for (uint16_t i = 0; i < e_phnum; i++) {
-        uint32_t p_type; uint64_t p_vaddr, p_memsz, p_offset, p_filesz;
+        uint32_t p_type; uint64_t p_vaddr, p_memsz, p_offset, p_filesz, p_align;
         if (bits == 64) {
             Elf64_Phdr* p = (Elf64_Phdr*)(phbuf + i * e_phentsize);
             p_type = p->p_type; p_vaddr = p->p_vaddr; p_memsz = p->p_memsz;
-            p_offset = p->p_offset; p_filesz = p->p_filesz;
+            p_offset = p->p_offset; p_filesz = p->p_filesz; p_align = p->p_align;
         }
         else {
             Elf32_Phdr* p = (Elf32_Phdr*)(phbuf + i * e_phentsize);
             p_type = p->p_type; p_vaddr = p->p_vaddr; p_memsz = p->p_memsz;
-            p_offset = p->p_offset; p_filesz = p->p_filesz;
+            p_offset = p->p_offset; p_filesz = p->p_filesz; p_align = p->p_align;
         }
 
         if (p_type == PT_PHDR)
@@ -163,6 +164,13 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
         if (p_type == PT_INTERP && p_filesz > 0 && p_filesz < sizeof(out->interp)) {
             if (fread_at(fh, p_offset, out->interp, (DWORD)p_filesz))
                 out->interp[p_filesz] = '\0';
+        }
+
+        if (p_type == PT_TLS) {
+            out->tls_vaddr  = p_vaddr;
+            out->tls_filesz = p_filesz;
+            out->tls_memsz  = p_memsz;
+            out->tls_align  = p_align ? p_align : 16;
         }
 
         if (p_type != PT_LOAD || p_memsz == 0) continue;
@@ -292,6 +300,15 @@ bool MineLoad(LPCSTR path, uint8_t bits, MineImage* out)
      * adjusted by the load bias (correct for PIE, 0 for ET_EXEC). */
     out->phdr_va = phdr_vaddr ? phdr_vaddr + load_bias : out->base + e_phoff;
     out->phnum = e_phnum;
+
+    if (out->tls_memsz > 0) {
+        out->tls_vaddr += load_bias;
+        printf("[MinE] PT_TLS  vaddr=0x%llX  filesz=0x%llX  memsz=0x%llX  align=%llu\n",
+            (unsigned long long)out->tls_vaddr,
+            (unsigned long long)out->tls_filesz,
+            (unsigned long long)out->tls_memsz,
+            (unsigned long long)out->tls_align);
+    }
 
     printf("[MinE] Loaded OK  base=0x%llX  entry=0x%llX\n",
         (unsigned long long)out->base,

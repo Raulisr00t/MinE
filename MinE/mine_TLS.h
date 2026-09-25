@@ -3,15 +3,22 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "mine_load.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-	bool MineTLSInit(void);
+	bool MineTLSInit(const MineImage* img);
 
 	/* Returns the FS base we installed */
 	uint64_t MineTLSBase(void);
+
+	/* Returns pointer to the TLS data block (for __tls_get_addr) */
+	uint8_t* MineTLSGetBlock(void);
+
+	/* Returns the total TLS block size */
+	uint64_t MineTLSGetSize(void);
 
 #ifdef __cplusplus
 }
