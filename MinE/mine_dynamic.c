@@ -2744,6 +2744,45 @@ uint64_t MineGetGuestFS(void)
 int MineGetGuestArgc(void) { return g_guest_argc; }
 char** MineGetGuestArgv(void) { return g_guest_argv; }
 
+/*
+ * force_rust_args: after INIT_ARRAY constructors, directly write argc/argv
+ * into the binary's Rust ARGC/ARGV statics by decoding INIT[00]'s machine code.
+ *
+ * Rust's std::env::args_os() on glibc reads from AtomicIsize ARGC and
+ * AtomicPtr ARGV, which are set by an INIT_ARRAY constructor.  If args_os()
+ * returns empty despite the constructor running, this re-writes the values.
+ *
+ * INIT[00] machine code pattern:
+ *   55                      push rbp
+ *   48 89 E5                mov rbp, rsp
+ *   48 63 C7                movsxd rax, edi          ; argc
+ *   48 89 05 XX XX XX XX    mov [rip+disp32], rax    ; store ARGC  (ends at +14)
+ *   48 89 35 YY YY YY YY    mov [rip+disp32], rsi    ; store ARGV  (ends at +21)
+ */
+static void force_rust_args(uint64_t init_fn, int argc, char** argv)
+{
+    uint8_t* fn = (uint8_t*)(uintptr_t)init_fn;
+    if (fn[0] != 0x55 || fn[1] != 0x48 || fn[2] != 0x89 || fn[3] != 0xE5 ||
+        fn[4] != 0x48 || fn[5] != 0x63 || fn[6] != 0xC7 ||
+        fn[7] != 0x48 || fn[8] != 0x89 || fn[9] != 0x05)
+        return;
+    if (fn[14] != 0x48 || fn[15] != 0x89 || fn[16] != 0x35)
+        return;
+
+    int32_t argc_disp, argv_disp;
+    memcpy(&argc_disp, fn + 10, 4);
+    memcpy(&argv_disp, fn + 17, 4);
+
+    volatile int64_t* argc_ptr = (volatile int64_t*)(fn + 14 + argc_disp);
+    volatile void**   argv_ptr = (volatile void**)(fn + 21 + argv_disp);
+
+    fprintf(stderr, "[MinE-Dyn] force_rust_args: ARGC @ %p (was %lld), ARGV @ %p (was %p)\n",
+        (void*)argc_ptr, (long long)*argc_ptr, (void*)argv_ptr, *argv_ptr);
+
+    *argc_ptr = (int64_t)argc;
+    *argv_ptr = (void*)argv;
+}
+
 static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
     void* init, void* fini, void* r, void* s)
 {
@@ -2803,6 +2842,11 @@ static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
             restore_fs(win_fs);
         }
     }
+
+    /* Force-write ARGC/ARGV after all constructors, before main */
+    if (g_init_array[0])
+        force_rust_args(g_init_array[0], argc, argv);
+
     g_init_array_count = 0;
 
     int ret = call_linux_fn3((void*)m,
