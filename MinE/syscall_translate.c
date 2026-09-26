@@ -17,6 +17,8 @@
 #include "mine_process.h"
 #include "mine_TLS.h"
 #include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -184,6 +186,11 @@
 #define SYS_fchownat          260
 #define SYS_linkat            265
 #define SYS_symlinkat         266
+#define SYS_statx             332
+#define SYS_copy_file_range   326
+#define SYS_memfd_create      319
+#define SYS_sched_getaffinity 204
+#define SYS_sched_setaffinity 203
 
 /* ─── Linux errno ─────────────────────────────────────────────────────────── */
 #define LINUX_EPERM      1
@@ -510,6 +517,8 @@ static int64_t sys_stat(const char* path, Linux_stat* st)
 
 static int64_t sys_lseek(int fd, int64_t off, int whence)
 {
+    if (MineVFSIsVFD(fd))
+        return MineVFSLseek(fd, off, whence);
     int64_t r = _lseeki64(fd, off, whence); return r < 0 ? -(int64_t)LINUX_EIO : r;
 }
 
@@ -798,7 +807,11 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
 /* ─── Sockets ─────────────────────────────────────────────────────────────── */
 static int64_t sys_socket(int domain, int type, int protocol)
 {
-    ensure_wsa(); int wtype = type & 0xF;
+    ensure_wsa();
+    int wtype = type & 0xF;
+    /* Linux "ping socket": SOCK_DGRAM + IPPROTO_ICMP → SOCK_RAW on Windows */
+    if (wtype == SOCK_DGRAM && (protocol == 1 /*IPPROTO_ICMP*/ || protocol == 58 /*IPPROTO_ICMPV6*/))
+        wtype = SOCK_RAW;
     SOCKET s = socket(domain, wtype, protocol);
     if (s == INVALID_SOCKET) return wsaerr();
     int fd = _open_osfhandle((intptr_t)s, 0);
@@ -870,20 +883,53 @@ static int64_t sys_getpeername(int fd, void* addr, uint32_t* addrlen)
     if (addrlen) *addrlen = (uint32_t)alen; return 0;
 }
 
+static int translate_sockopt(int level, int optname, int* wlevel, int* woptname)
+{
+    *wlevel = level;
+    *woptname = optname;
+    if (level == 1) { /* Linux SOL_SOCKET → Windows SOL_SOCKET */
+        *wlevel = SOL_SOCKET;
+        switch (optname) {
+        case 2:  *woptname = SO_REUSEADDR; break;
+        case 6:  *woptname = SO_BROADCAST; break;
+        case 7:  *woptname = SO_SNDBUF; break;
+        case 8:  *woptname = SO_RCVBUF; break;
+        case 9:  *woptname = SO_KEEPALIVE; break;
+        case 13: *woptname = SO_LINGER; break;
+        case 20: *woptname = SO_RCVTIMEO; break;
+        case 21: *woptname = SO_SNDTIMEO; break;
+        case 11: return -1; /* SO_NO_CHECK — not supported */
+        case 15: *woptname = SO_REUSEADDR; break; /* SO_REUSEPORT */
+        default: break;
+        }
+    } else if (level == 0) { /* IPPROTO_IP */
+        switch (optname) {
+        case 2:  *woptname = 4; break;   /* Linux IP_TTL(2) → Win IP_TTL(4) */
+        case 3:  *woptname = 3; break;   /* IP_TOS → IP_TOS (same) */
+        case 11: return -1;              /* IP_RECVERR — not supported on Windows */
+        case 12: *woptname = 12; break;  /* IP_MULTICAST_TTL */
+        default: break;
+        }
+    }
+    return 0;
+}
+
 static int64_t sys_setsockopt(int fd, int level, int optname, const void* optval, uint32_t optlen)
 {
     SOCKET s = (SOCKET)_get_osfhandle(fd);
     if (s == (SOCKET)INVALID_HANDLE_VALUE) return -(int64_t)LINUX_EBADF;
-    int wlevel = (level == 1) ? SOL_SOCKET : level;
-    return setsockopt(s, wlevel, optname, (const char*)optval, (int)optlen) == SOCKET_ERROR ? wsaerr() : 0;
+    int wlevel, woptname;
+    if (translate_sockopt(level, optname, &wlevel, &woptname) < 0) return 0;
+    return setsockopt(s, wlevel, woptname, (const char*)optval, (int)optlen) == SOCKET_ERROR ? wsaerr() : 0;
 }
 
 static int64_t sys_getsockopt(int fd, int level, int optname, void* optval, uint32_t* optlen)
 {
     SOCKET s = (SOCKET)_get_osfhandle(fd);
     if (s == (SOCKET)INVALID_HANDLE_VALUE) return -(int64_t)LINUX_EBADF;
-    int wlevel = (level == 1) ? SOL_SOCKET : level, olen = optlen ? (int)*optlen : 0;
-    if (getsockopt(s, wlevel, optname, (char*)optval, &olen) == SOCKET_ERROR) return wsaerr();
+    int wlevel, woptname, olen = optlen ? (int)*optlen : 0;
+    if (translate_sockopt(level, optname, &wlevel, &woptname) < 0) return -(int64_t)92 /*ENOPROTOOPT*/;
+    if (getsockopt(s, wlevel, woptname, (char*)optval, &olen) == SOCKET_ERROR) return wsaerr();
     if (optlen) *optlen = (uint32_t)olen; return 0;
 }
 
@@ -1179,6 +1225,24 @@ static int64_t sys_getrusage(int who, void* buf)
 /* ─── sendfile ────────────────────────────────────────────────────────────── */
 static int64_t sys_sendfile(int out_fd, int in_fd, int64_t* offset, uint64_t count)
 {
+    /* Handle VFD sources (e.g. /etc/passwd, /proc/*) */
+    if (MineVFSIsVFD(in_fd)) {
+        if (offset) MineVFSLseek(in_fd, *offset, 0);
+        char buf[8192];
+        int64_t total = 0;
+        while ((uint64_t)total < count) {
+            uint64_t to_read = (count - total) < sizeof(buf) ? (count - total) : sizeof(buf);
+            int64_t got = MineVFSRead(in_fd, buf, to_read);
+            if (got <= 0) break;
+            int64_t w = sys_write(out_fd, buf, (uint64_t)got);
+            if (w < 0) return total > 0 ? total : w;
+            total += w;
+            if (w < got) break;
+        }
+        if (offset) *offset += total;
+        return total;
+    }
+
     HANDLE hin = (HANDLE)_get_osfhandle(in_fd);
     if (hin == INVALID_HANDLE_VALUE) return -(int64_t)LINUX_EBADF;
 
@@ -1482,14 +1546,24 @@ uint64_t MineSyscall(uint64_t nr,
     } break;
     case SYS_getdents:    ret = (uint64_t)sys_getdents64((int)a1, (void*)a2, (uint32_t)a3); break;
     case SYS_utimensat:   ret = 0; break;
-    case SYS_renameat: case SYS_renameat2:
-        ret = MoveFileExA((char*)a2, (char*)a4, MOVEFILE_REPLACE_EXISTING) ? 0 : (uint64_t)winerr(); break;
-    case SYS_unlinkat: {
-        const char* p = (const char*)a2;
-        if ((int)a3 & 0x200) ret = RemoveDirectoryA(p) ? 0 : (uint64_t)winerr();
-        else ret = DeleteFileA(p) ? 0 : (uint64_t)winerr();
+    case SYS_renameat: case SYS_renameat2: {
+        int vt1 = VFS_REAL, vt2 = VFS_REAL;
+        const char* wp1 = MineVFSTranslate((char*)a2, &vt1);
+        const char* wp2 = MineVFSTranslate((char*)a4, &vt2);
+        ret = MoveFileExA(wp1 ? wp1 : (char*)a2, wp2 ? wp2 : (char*)a4, MOVEFILE_REPLACE_EXISTING) ? 0 : (uint64_t)winerr();
     } break;
-    case SYS_mkdirat:     ret = CreateDirectoryA((char*)a2, NULL) ? 0 : (uint64_t)winerr(); break;
+    case SYS_unlinkat: {
+        int vt = VFS_REAL;
+        const char* wp = MineVFSTranslate((const char*)a2, &vt);
+        const char* rp = wp ? wp : (const char*)a2;
+        if ((int)a3 & 0x200) ret = RemoveDirectoryA(rp) ? 0 : (uint64_t)winerr();
+        else ret = DeleteFileA(rp) ? 0 : (uint64_t)winerr();
+    } break;
+    case SYS_mkdirat: {
+        int vt = VFS_REAL;
+        const char* wp = MineVFSTranslate((char*)a2, &vt);
+        ret = CreateDirectoryA(wp ? wp : (char*)a2, NULL) ? 0 : (uint64_t)winerr();
+    } break;
     case SYS_fchmodat: case SYS_fchownat: case SYS_linkat: case SYS_symlinkat:
         ret = 0; break;
     case SYS_statfs: case SYS_fstatfs: {
@@ -1553,6 +1627,62 @@ uint64_t MineSyscall(uint64_t nr,
     case SYS_rename:      ret = MoveFileExA((char*)a1, (char*)a2, MOVEFILE_REPLACE_EXISTING) ? 0 : winerr(); break;
     case SYS_chmod: case SYS_fchmod: case SYS_chown:
     case SYS_fchown: case SYS_lchown: ret = 0; break;
+    case SYS_statx: {
+        const char* p = (const char*)a2;
+        if (!a5) { ret = (uint64_t)-(int64_t)LINUX_EFAULT; break; }
+        Linux_stat st; memset(&st, 0, sizeof(st));
+        int64_t sr = sys_stat(p, &st);
+        if (sr < 0) { ret = (uint64_t)sr; break; }
+        uint8_t* sx = (uint8_t*)a5;
+        memset(sx, 0, 256);
+        *(uint32_t*)(sx + 0) = 0x7FF;
+        *(uint32_t*)(sx + 4) = 4096;
+        *(uint32_t*)(sx + 16) = (uint32_t)st.st_nlink;
+        *(uint32_t*)(sx + 20) = (uint32_t)st.st_uid;
+        *(uint32_t*)(sx + 24) = (uint32_t)st.st_gid;
+        *(uint16_t*)(sx + 28) = (uint16_t)st.st_mode;
+        *(uint64_t*)(sx + 32) = st.st_ino;
+        *(uint64_t*)(sx + 40) = st.st_size;
+        *(uint64_t*)(sx + 48) = st.st_blocks;
+        ret = 0;
+    } break;
+    case SYS_copy_file_range: {
+        char buf[8192];
+        int64_t* off_in = a3 ? (int64_t*)a3 : NULL;
+        int64_t* off_out = a5 ? (int64_t*)a5 : NULL;
+        if (off_in) _lseeki64((int)a1, *off_in, SEEK_SET);
+        if (off_out) _lseeki64((int)a2, *off_out, SEEK_SET);
+        size_t total = 0, len = (size_t)a4;
+        while (total < len) {
+            size_t chunk = len - total;
+            if (chunk > sizeof(buf)) chunk = sizeof(buf);
+            int r = _read((int)a1, buf, (unsigned int)chunk);
+            if (r <= 0) break;
+            int w = _write((int)a2, buf, r);
+            if (w <= 0) break;
+            total += w;
+            if (off_in) *off_in += w;
+            if (off_out) *off_out += w;
+        }
+        ret = (uint64_t)total;
+    } break;
+    case SYS_memfd_create: {
+        char tmp[MAX_PATH];
+        GetTempPathA(sizeof(tmp), tmp);
+        char name[MAX_PATH];
+        snprintf(name, sizeof(name), "%smfd_%u_%u", tmp, GetCurrentProcessId(), GetCurrentThreadId());
+        int fd = _open(name, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+        ret = fd < 0 ? (uint64_t)-(int64_t)LINUX_ENOMEM : (uint64_t)fd;
+    } break;
+    case SYS_sched_getaffinity: {
+        DWORD_PTR proc_mask, sys_mask;
+        GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
+        size_t sz = (size_t)a2;
+        if (sz > sizeof(DWORD_PTR)) sz = sizeof(DWORD_PTR);
+        if (a3) { memset((void*)a3, 0, (size_t)a2); memcpy((void*)a3, &proc_mask, sz); }
+        ret = (uint64_t)sz;
+    } break;
+    case SYS_sched_setaffinity: ret = 0; break;
     case SYS_exit: case SYS_exit_group:
         MineTraceExit(nr, a1); ExitProcess((UINT)a1); return 0;
     default:

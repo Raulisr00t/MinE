@@ -20,6 +20,9 @@ extern "C" {
 	void     MineDynSetGuestFS(uint64_t fs);
 	uint64_t MineGetGuestFS(void);
 
+	int    MineGetGuestArgc(void);
+	char** MineGetGuestArgv(void);
+
 #ifdef __cplusplus
 }
 #endif

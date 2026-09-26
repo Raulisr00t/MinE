@@ -13,6 +13,7 @@
 #include "mine_signal.h"
 #include "mine_thread.h"
 #include "mine_process.h"
+#include "mine_trace.h"
 #include <io.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -206,6 +207,8 @@ static int stub_sprintf_chk(char* buf, int flag, size_t slen, const char* fmt, .
 }
 
 static void* stub_memcpy_chk(void* d, const void* s, size_t n, size_t ds) { (void)ds; return memcpy(d, s, n); }
+static void* stub_memset_chk(void* d, int c, size_t n, size_t ds) { (void)ds; return memset(d, c, n); }
+static void* stub_memmove_chk(void* d, const void* s, size_t n, size_t ds) { (void)ds; return memmove(d, s, n); }
 
 static void* stub_malloc(size_t n) { return malloc(n); }
 static void  stub_free(void* p) { free(p); }
@@ -2102,6 +2105,109 @@ static char* stub_nl_langinfo_real(int item)
     }
 }
 
+/* ─── readdir64 / openat64 ────────────────────────────────────────────────── */
+static void* stub_readdir64(void* d) { return MineReaddir((MineDIR*)d); }
+static int   stub_openat64(int dirfd, const char* path, int flags, ...) { return stub_openat(dirfd, path, flags); }
+
+/* ─── __ctype_toupper_loc ─────────────────────────────────────────────────── */
+static const int32_t g_toupper_tbl[384] = {0};
+static int g_toupper_inited = 0;
+static int32_t g_toupper_full[384];
+static const int32_t* g_toupper_ptr;
+static const int32_t** stub_ctype_toupper_loc(void)
+{
+    if (!g_toupper_inited) {
+        for (int i = 0; i < 384; i++) {
+            int c = i - 128;
+            g_toupper_full[i] = (c >= 'a' && c <= 'z') ? (c - 32) : c;
+        }
+        g_toupper_ptr = &g_toupper_full[128];
+        g_toupper_inited = 1;
+    }
+    return &g_toupper_ptr;
+}
+
+/* ─── posix_spawn stubs ──────────────────────────────────────────────────── */
+static int stub_posix_spawn(void* pid, const char* path, void* fa, void* sa, char** argv, char** envp)
+{
+    (void)fa; (void)sa; (void)envp;
+    if (!path) return 22;
+    int64_t r = MineExecve(path, argv, envp);
+    if (pid) *(int*)pid = 0;
+    return (r < 0) ? 2 : 0;
+}
+
+static int stub_posix_spawnp(void* pid, const char* file, void* fa, void* sa, char** argv, char** envp)
+{
+    return stub_posix_spawn(pid, file, fa, sa, argv, envp);
+}
+
+static int stub_posix_spawn_file_actions_init(void* fa) { if (fa) memset(fa, 0, 80); return 0; }
+static int stub_posix_spawn_file_actions_destroy(void* fa) { (void)fa; return 0; }
+static int stub_posix_spawn_file_actions_addclose(void* fa, int fd) { (void)fa; (void)fd; return 0; }
+static int stub_posix_spawn_file_actions_adddup2(void* fa, int fd, int nfd) { (void)fa; (void)fd; (void)nfd; return 0; }
+static int stub_posix_spawn_file_actions_addopen(void* fa, int fd, const char* p, int f, unsigned m)
+{ (void)fa; (void)fd; (void)p; (void)f; (void)m; return 0; }
+static int stub_posix_spawnattr_init(void* sa) { if (sa) memset(sa, 0, 336); return 0; }
+static int stub_posix_spawnattr_destroy(void* sa) { (void)sa; return 0; }
+static int stub_posix_spawnattr_setflags(void* sa, short f) { (void)sa; (void)f; return 0; }
+static int stub_posix_spawnattr_setsigdefault(void* sa, void* s) { (void)sa; (void)s; return 0; }
+static int stub_posix_spawnattr_setsigmask(void* sa, void* s) { (void)sa; (void)s; return 0; }
+
+/* ─── _Unwind stubs (C++ exception unwinding — noop) ─────────────────────── */
+static void  stub_unwind_resume(void* p) { (void)p; TerminateProcess(GetCurrentProcess(), 134); }
+static void* stub_unwind_getcfa(void* ctx) { (void)ctx; return NULL; }
+static void* stub_unwind_getip(void* ctx) { (void)ctx; return NULL; }
+static int   stub_unwind_backtrace(void* cb, void* data) { (void)cb; (void)data; return 5; }
+static int   stub_unwind_setip(void* ctx, void* ip) { (void)ctx; (void)ip; return 0; }
+static int   stub_unwind_setgr(void* ctx, int idx, void* val) { (void)ctx; (void)idx; (void)val; return 0; }
+
+/* ─── statfs / fstatfs ───────────────────────────────────────────────────── */
+#pragma pack(push,1)
+typedef struct {
+    int64_t  f_type;
+    int64_t  f_bsize;
+    uint64_t f_blocks, f_bfree, f_bavail;
+    uint64_t f_files, f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen;
+    int64_t  f_frsize;
+    int64_t  f_flags;
+    int64_t  f_spare[4];
+} Linux_statfs;
+#pragma pack(pop)
+
+static int stub_statfs(const char* path, void* buf)
+{
+    if (!buf) return -1;
+    Linux_statfs* sf = (Linux_statfs*)buf;
+    memset(sf, 0, sizeof(*sf));
+    sf->f_type = 0xEF53;
+    sf->f_bsize = 4096;
+    sf->f_frsize = 4096;
+    sf->f_namelen = 255;
+    char root[4] = "C:\\";
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    const char* use = wp ? wp : path;
+    if (use && use[0] && use[1] == ':') root[0] = use[0];
+    ULARGE_INTEGER avail, total, free_bytes;
+    if (GetDiskFreeSpaceExA(root, &avail, &total, &free_bytes)) {
+        sf->f_blocks = total.QuadPart / 4096;
+        sf->f_bfree = free_bytes.QuadPart / 4096;
+        sf->f_bavail = avail.QuadPart / 4096;
+    }
+    sf->f_files = 1000000;
+    sf->f_ffree = 500000;
+    return 0;
+}
+
+static int stub_fstatfs(int fd, void* buf)
+{
+    (void)fd;
+    return stub_statfs("C:\\", buf);
+}
+
 /* ─── FTS file tree walk (used by coreutils rm, chmod, chown) ─────────────── */
 typedef struct fts_s {
     HANDLE hFind;
@@ -2330,6 +2436,270 @@ static int stub_vsnprintf_chk(char* s, size_t maxlen, int flag, size_t slen, con
     return vsnprintf(s, maxlen, fmt, ap);
 }
 
+/* ─── AT-based file operations ────────────────────────────────────────────── */
+#include <sys/types.h>
+
+static int stub_fchmodat(int dirfd, const char* path, unsigned int mode, int flags)
+{
+    (void)dirfd; (void)flags;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    if (vt != VFS_REAL) return 0;
+    return _chmod(wp ? wp : path, mode & 0777) == 0 ? 0 : -1;
+}
+
+static int stub_fchownat(int dirfd, const char* path, int owner, int group, int flags)
+{
+    (void)dirfd; (void)path; (void)owner; (void)group; (void)flags;
+    return 0;
+}
+
+static int stub_unlinkat(int dirfd, const char* path, int flags)
+{
+    (void)dirfd;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    if (vt != VFS_REAL) return -1;
+    const char* rp = wp ? wp : path;
+    if (flags & 0x200) /* AT_REMOVEDIR */
+        return _rmdir(rp) == 0 ? 0 : -1;
+    return _unlink(rp) == 0 ? 0 : -1;
+}
+
+static int stub_mkdirat(int dirfd, const char* path, unsigned int mode)
+{
+    (void)dirfd; (void)mode;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    return _mkdir(wp ? wp : path) == 0 ? 0 : -1;
+}
+
+static int stub_utimensat(int dirfd, const char* path, const void* times, int flags)
+{
+    (void)dirfd; (void)path; (void)times; (void)flags;
+    return 0;
+}
+
+static int stub_renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath)
+{
+    (void)olddirfd; (void)newdirfd;
+    int vt1 = VFS_REAL, vt2 = VFS_REAL;
+    const char* wp1 = MineVFSTranslate(oldpath, &vt1);
+    const char* wp2 = MineVFSTranslate(newpath, &vt2);
+    return rename(wp1 ? wp1 : oldpath, wp2 ? wp2 : newpath) == 0 ? 0 : -1;
+}
+
+static int stub_renameat2(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, unsigned int flags)
+{
+    (void)flags;
+    return stub_renameat(olddirfd, oldpath, newdirfd, newpath);
+}
+
+static int stub_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags)
+{
+    (void)olddirfd; (void)newdirfd; (void)flags;
+    int vt1 = VFS_REAL, vt2 = VFS_REAL;
+    const char* wp1 = MineVFSTranslate(oldpath, &vt1);
+    const char* wp2 = MineVFSTranslate(newpath, &vt2);
+    return CreateHardLinkA(wp2 ? wp2 : newpath, wp1 ? wp1 : oldpath, NULL) ? 0 : -1;
+}
+
+static int stub_symlinkat(const char* target, int newdirfd, const char* linkpath)
+{
+    (void)newdirfd;
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(linkpath, &vt);
+    return CreateSymbolicLinkA(wp ? wp : linkpath, target, 0) ? 0 : -1;
+}
+
+static int64_t stub_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz)
+{
+    (void)dirfd;
+    int vt = VFS_REAL;
+    MineVFSTranslate(path, &vt);
+    if (vt == VFS_PROC_SELF_EXE)
+        return MineVFSReadlink(vt, buf, bufsiz);
+    return -22; /* EINVAL */
+}
+
+/* ─── directory extras ────────────────────────────────────────────────────── */
+#include "mine_thread.h"
+
+static void stub_rewinddir(void* dirp)
+{
+    (void)dirp;
+}
+
+static int stub_dirfd(void* dirp)
+{
+    (void)dirp;
+    return 999;
+}
+
+static void* stub_fdopendir(int fd)
+{
+    (void)fd;
+    return NULL;
+}
+
+/* ─── statx ───────────────────────────────────────────────────────────────── */
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t _pad1;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    /* timestamps: atime, btime, ctime, mtime (each 16 bytes) */
+    uint8_t  stx_times[64];
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint64_t _pad2[13];
+} Linux_statx;
+#pragma pack(pop)
+
+static int stub_statx(int dirfd, const char* path, int flags, unsigned int mask, Linux_statx* buf)
+{
+    (void)dirfd; (void)flags; (void)mask;
+    if (!buf) return -14; /* EFAULT */
+    memset(buf, 0, sizeof(*buf));
+    int vt = VFS_REAL;
+    const char* wp = MineVFSTranslate(path, &vt);
+    if (vt != VFS_REAL) {
+        buf->stx_mask = 0x7FF;
+        buf->stx_mode = 0100644;
+        buf->stx_nlink = 1;
+        buf->stx_blksize = 4096;
+        return 0;
+    }
+    const char* rp = wp ? wp : path;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(rp, GetFileExInfoStandard, &fa))
+        return -2; /* ENOENT */
+    buf->stx_mask = 0x7FF;
+    buf->stx_blksize = 4096;
+    buf->stx_nlink = 1;
+    if (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        buf->stx_mode = 040755;
+    else
+        buf->stx_mode = 0100644;
+    buf->stx_size = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    buf->stx_blocks = (buf->stx_size + 511) / 512;
+    return 0;
+}
+
+/* ─── miscellaneous missing stubs ─────────────────────────────────────────── */
+
+static int stub_gettid(void) { return (int)GetCurrentThreadId(); }
+
+static const char* stub_gnu_get_libc_version(void) { return "2.39"; }
+
+static int stub_socketpair(int domain, int type, int protocol, int sv[2])
+{
+    (void)domain; (void)type; (void)protocol;
+    return (int)MineVFSPipe(sv, 0) == 0 ? 0 : -1;
+}
+
+static int stub_sigaltstack(const void* ss, void* oss)
+{
+    (void)ss;
+    if (oss) memset(oss, 0, 24);
+    return 0;
+}
+
+static int stub_waitid(int idtype, int id, void* infop, int options)
+{
+    (void)idtype; (void)id; (void)infop; (void)options;
+    return -38; /* ENOSYS */
+}
+
+static int64_t stub_copy_file_range(int fd_in, int64_t* off_in,
+    int fd_out, int64_t* off_out, size_t len, unsigned int flags)
+{
+    (void)flags;
+    char buf[8192];
+    if (off_in) _lseeki64(fd_in, *off_in, SEEK_SET);
+    if (off_out) _lseeki64(fd_out, *off_out, SEEK_SET);
+    size_t total = 0;
+    while (total < len) {
+        size_t chunk = len - total;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        int r = _read(fd_in, buf, (unsigned int)chunk);
+        if (r <= 0) break;
+        int w = _write(fd_out, buf, r);
+        if (w <= 0) break;
+        total += w;
+        if (off_in) *off_in += w;
+        if (off_out) *off_out += w;
+    }
+    return (int64_t)total;
+}
+
+static int stub_bcmp(const void* s1, const void* s2, size_t n)
+{
+    return memcmp(s1, s2, n);
+}
+
+static float stub_log10f(float x) { return (float)log10((double)x); }
+static float stub_powf(float x, float y) { return (float)pow((double)x, (double)y); }
+static float stub_floorf(float x) { return (float)floor((double)x); }
+static float stub_ceilf(float x) { return (float)ceil((double)x); }
+static float stub_fmodf(float x, float y) { return (float)fmod((double)x, (double)y); }
+static float stub_roundf(float x) { return (float)round((double)x); }
+static float stub_expf(float x) { return (float)exp((double)x); }
+static float stub_logf(float x) { return (float)log((double)x); }
+static float stub_log2f(float x) { return (float)(log((double)x) / log(2.0)); }
+static float stub_tanf(float x) { return (float)tan((double)x); }
+static float stub_atan2f(float x, float y) { return (float)atan2((double)x, (double)y); }
+static float stub_atanf(float x) { return (float)atan((double)x); }
+static float stub_asinf(float x) { return (float)asin((double)x); }
+static float stub_acosf(float x) { return (float)acos((double)x); }
+static double stub_asin_w(double x) { return asin(x); }
+static double stub_acos_w(double x) { return acos(x); }
+static double stub_atan_w(double x) { return atan(x); }
+static double stub_cbrt_w(double x) { return cbrt(x); }
+
+/* SELinux context stubs */
+static void* stub_context_new(const char* s) { (void)s; return NULL; }
+static const char* stub_context_str(void* ctx) { (void)ctx; return ""; }
+static void stub_context_free(void* ctx) { (void)ctx; }
+static const char* stub_context_type_get(void* ctx) { (void)ctx; return ""; }
+static const char* stub_context_user_get(void* ctx) { (void)ctx; return ""; }
+static const char* stub_context_role_get(void* ctx) { (void)ctx; return ""; }
+static const char* stub_context_range_get(void* ctx) { (void)ctx; return ""; }
+static int stub_context_type_set(void* ctx, const char* s) { (void)ctx; (void)s; return -1; }
+static int stub_context_user_set(void* ctx, const char* s) { (void)ctx; (void)s; return -1; }
+static int stub_context_role_set(void* ctx, const char* s) { (void)ctx; (void)s; return -1; }
+static int stub_context_range_set(void* ctx, const char* s) { (void)ctx; (void)s; return -1; }
+static int stub_freecon(char* c) { (void)c; return 0; }
+static int stub_lgetfilecon(const char* p, char** c) { (void)p; if (c) *c = NULL; return -1; }
+static int stub_getfilecon(const char* p, char** c) { (void)p; if (c) *c = NULL; return -1; }
+static int stub_fgetfilecon(int fd, char** c) { (void)fd; if (c) *c = NULL; return -1; }
+static int stub_setfilecon(const char* p, const char* c) { (void)p; (void)c; return -1; }
+static int stub_lsetfilecon(const char* p, const char* c) { (void)p; (void)c; return -1; }
+static int stub_security_get_boolean_active(const char* n) { (void)n; return 0; }
+
+/* _Unwind extras */
+static uint64_t stub_unwind_getipinfo(void* ctx, int* ip_before_insn) { (void)ctx; if (ip_before_insn) *ip_before_insn = 0; return 0; }
+static uint64_t stub_unwind_getdatarelbase(void* ctx) { (void)ctx; return 0; }
+static uint64_t stub_unwind_gettextrelbase(void* ctx) { (void)ctx; return 0; }
+
+/* __progname / __progname_full / program_invocation_name — used by uptime, coreutils */
+static char* g_progname = (char*)"mine";
+static char* g_progname_full = (char*)"mine";
+static char* g_program_invocation_name = (char*)"mine";
+static char* g_program_invocation_short_name = (char*)"mine";
+
 /* ─── __libc_start_main ───────────────────────────────────────────────────── */
 typedef int(*main_fn_t)(int, char**, char**);
 static char** g_envp = NULL;
@@ -2343,9 +2713,12 @@ extern void MineWinToLinux(void);
 static uint64_t g_saved_guest_fs = 0;
 
 /* DT_INIT_ARRAY deferred until stub_libc_start_main has argc/argv */
-#define MAX_INIT_ARRAY 32
+#define MAX_INIT_ARRAY 256
 static uint64_t g_init_array[MAX_INIT_ARRAY];
 static int      g_init_array_count = 0;
+
+static int    g_guest_argc = 0;
+static char** g_guest_argv = NULL;
 
 /*
  * call_linux_fn3: call a Linux-ABI function from Windows code.
@@ -2368,6 +2741,9 @@ uint64_t MineGetGuestFS(void)
     return g_saved_guest_fs;
 }
 
+int MineGetGuestArgc(void) { return g_guest_argc; }
+char** MineGetGuestArgv(void) { return g_guest_argv; }
+
 static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
     void* init, void* fini, void* r, void* s)
 {
@@ -2375,32 +2751,54 @@ static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
 
     uint64_t win_fs = save_fs();
 
-    /* The 'init' parameter is __libc_csu_init which expects (argc,argv,envp).
-     * Call it via Linux ABI using MineWinToLinux. */
+    g_guest_argc = argc;
+    g_guest_argv = argv;
+
+    if (argc > 0 && argv && argv[0]) {
+        const char* base = argv[0];
+        for (const char* p = argv[0]; *p; p++)
+            if (*p == '/' || *p == '\\') base = p + 1;
+        g_progname = (char*)base;
+        g_progname_full = argv[0];
+        g_program_invocation_name = argv[0];
+        g_program_invocation_short_name = (char*)base;
+    }
+
+    fprintf(stderr, "[MinE-Dyn] __libc_start_main: argc=%d argv[0]=\"%s\" init=%p init_array=%d\n",
+        argc, (argv && argv[0]) ? argv[0] : "(null)", init, g_init_array_count);
+
     if (init) {
         typedef int (*win_fn_t)(void*, uint64_t, uint64_t, uint64_t);
-        ((win_fn_t)MineWinToLinux)(init,
-            (uint64_t)argc,
-            (uint64_t)(uintptr_t)argv,
-            (uint64_t)(uintptr_t)g_envp);
+        __try {
+            restore_fs(g_saved_guest_fs);
+            ((win_fn_t)MineWinToLinux)(init,
+                (uint64_t)argc,
+                (uint64_t)(uintptr_t)argv,
+                (uint64_t)(uintptr_t)g_envp);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            fprintf(stderr, "[MinE-Dyn] __libc_csu_init faulted (code 0x%lX)\n",
+                GetExceptionCode());
+        }
         g_saved_guest_fs = save_fs();
         restore_fs(win_fs);
     }
 
-    /* DT_INIT_ARRAY constructors: glibc's __libc_csu_init calls these with
-     * (argc, argv, envp). Rust's runtime init in INIT_ARRAY uses these args
-     * to save program arguments for std::env::args(). */
     for (int k = 0; k < g_init_array_count; k++) {
         uint64_t fn = g_init_array[k];
         if (fn && fn != (uint64_t)-1) {
             typedef int (*win_fn_t)(void*, uint64_t, uint64_t, uint64_t);
             __try {
+                restore_fs(g_saved_guest_fs);
                 ((win_fn_t)MineWinToLinux)((void*)(uintptr_t)fn,
                     (uint64_t)argc,
                     (uint64_t)(uintptr_t)argv,
                     (uint64_t)(uintptr_t)g_envp);
             }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                fprintf(stderr, "[MinE-Dyn] INIT_ARRAY[%d] @ 0x%llX faulted (code 0x%lX)\n",
+                    k, (unsigned long long)fn, GetExceptionCode());
+            }
             g_saved_guest_fs = save_fs();
             restore_fs(win_fs);
         }
@@ -2417,7 +2815,7 @@ static int stub_libc_start_main(main_fn_t m, int argc, char** argv,
 
 /* ─── stub table ──────────────────────────────────────────────────────────── */
 typedef struct { const char* name; void(*fn)(void); } SymStub;
-#define MAX_STUBS 600
+#define MAX_STUBS 700
 static SymStub s_stubs[MAX_STUBS];
 
 static void init_stubs(void)
@@ -2961,6 +3359,116 @@ static void init_stubs(void)
     S("fwrite_unlocked", stub_fwrite);
     S("feof_unlocked", stub_feof);
     S("ferror_unlocked", stub_ferror);
+    /* fortified libc */
+    S("__memset_chk", stub_memset_chk);
+    S("__memmove_chk", stub_memmove_chk);
+    S("__isoc23_sscanf", stub_sscanf);
+    S("__isoc23_scanf", stub_scanf_w);
+    S("__isoc23_fscanf", stub_fscanf_w);
+    S("__isoc23_strtol", stub_isoc23_strtol);
+    /* readdir64 / openat64 */
+    S("readdir64", stub_readdir64);
+    S("openat64", stub_openat64);
+    /* __ctype_toupper_loc */
+    S("__ctype_toupper_loc", stub_ctype_toupper_loc);
+    /* posix_spawn */
+    S("posix_spawn", stub_posix_spawn);
+    S("posix_spawnp", stub_posix_spawnp);
+    S("posix_spawn_file_actions_init", stub_posix_spawn_file_actions_init);
+    S("posix_spawn_file_actions_destroy", stub_posix_spawn_file_actions_destroy);
+    S("posix_spawn_file_actions_addclose", stub_posix_spawn_file_actions_addclose);
+    S("posix_spawn_file_actions_adddup2", stub_posix_spawn_file_actions_adddup2);
+    S("posix_spawn_file_actions_addopen", stub_posix_spawn_file_actions_addopen);
+    S("posix_spawnattr_init", stub_posix_spawnattr_init);
+    S("posix_spawnattr_destroy", stub_posix_spawnattr_destroy);
+    S("posix_spawnattr_setflags", stub_posix_spawnattr_setflags);
+    S("posix_spawnattr_setsigdefault", stub_posix_spawnattr_setsigdefault);
+    S("posix_spawnattr_setsigmask", stub_posix_spawnattr_setsigmask);
+    /* _Unwind stubs */
+    S("_Unwind_Resume", stub_unwind_resume);
+    S("_Unwind_GetCFA", stub_unwind_getcfa);
+    S("_Unwind_GetIP", stub_unwind_getip);
+    S("_Unwind_Backtrace", stub_unwind_backtrace);
+    S("_Unwind_SetIP", stub_unwind_setip);
+    S("_Unwind_SetGR", stub_unwind_setgr);
+    S("_Unwind_RaiseException", stub_unwind_backtrace);
+    S("_Unwind_DeleteException", stub_noop);
+    S("_Unwind_ForcedUnwind", stub_unwind_backtrace);
+    S("_Unwind_GetLanguageSpecificData", stub_unwind_getcfa);
+    S("_Unwind_GetRegionStart", stub_unwind_getcfa);
+    /* statfs / fstatfs */
+    S("statfs", stub_statfs);
+    S("fstatfs", stub_fstatfs);
+    S("statfs64", stub_statfs);
+    S("fstatfs64", stub_fstatfs);
+    /* AT-based file operations */
+    S("fchmodat", stub_fchmodat);
+    S("fchownat", stub_fchownat);
+    S("unlinkat", stub_unlinkat);
+    S("mkdirat", stub_mkdirat);
+    S("utimensat", stub_utimensat);
+    S("renameat", stub_renameat);
+    S("renameat2", stub_renameat2);
+    S("linkat", stub_linkat);
+    S("symlinkat", stub_symlinkat);
+    S("readlinkat", stub_readlinkat);
+    /* directory extras */
+    S("rewinddir", stub_rewinddir);
+    S("dirfd", stub_dirfd);
+    S("fdopendir", stub_fdopendir);
+    /* statx */
+    S("statx", stub_statx);
+    /* thread / process */
+    S("gettid", stub_gettid);
+    S("waitid", stub_waitid);
+    /* misc */
+    S("gnu_get_libc_version", stub_gnu_get_libc_version);
+    S("socketpair", stub_socketpair);
+    S("sigaltstack", stub_sigaltstack);
+    S("copy_file_range", stub_copy_file_range);
+    S("bcmp", stub_bcmp);
+    /* float math */
+    S("log10f", stub_log10f);
+    S("powf", stub_powf);
+    S("floorf", stub_floorf);
+    S("ceilf", stub_ceilf);
+    S("fmodf", stub_fmodf);
+    S("roundf", stub_roundf);
+    S("expf", stub_expf);
+    S("logf", stub_logf);
+    S("log2f", stub_log2f);
+    S("tanf", stub_tanf);
+    S("atan2f", stub_atan2f);
+    S("atanf", stub_atanf);
+    S("asinf", stub_asinf);
+    S("acosf", stub_acosf);
+    S("asin", stub_asin_w);
+    S("acos", stub_acos_w);
+    S("atan", stub_atan_w);
+    S("cbrt", stub_cbrt_w);
+    /* SELinux context */
+    S("context_new", stub_context_new);
+    S("context_str", stub_context_str);
+    S("context_free", stub_context_free);
+    S("context_type_get", stub_context_type_get);
+    S("context_user_get", stub_context_user_get);
+    S("context_role_get", stub_context_role_get);
+    S("context_range_get", stub_context_range_get);
+    S("context_type_set", stub_context_type_set);
+    S("context_user_set", stub_context_user_set);
+    S("context_role_set", stub_context_role_set);
+    S("context_range_set", stub_context_range_set);
+    S("freecon", stub_freecon);
+    S("lgetfilecon", stub_lgetfilecon);
+    S("getfilecon", stub_getfilecon);
+    S("fgetfilecon", stub_fgetfilecon);
+    S("setfilecon", stub_setfilecon);
+    S("lsetfilecon", stub_lsetfilecon);
+    S("security_get_boolean_active", stub_security_get_boolean_active);
+    /* _Unwind extras */
+    S("_Unwind_GetIPInfo", stub_unwind_getipinfo);
+    S("_Unwind_GetDataRelBase", stub_unwind_getdatarelbase);
+    S("_Unwind_GetTextRelBase", stub_unwind_gettextrelbase);
 #undef S
     s_stubs[i].name = NULL;
     s_stubs[i].fn = NULL;
@@ -2968,12 +3476,6 @@ static void init_stubs(void)
 
 /* ─── symbol data table ───────────────────────────────────────────────────── */
 typedef struct { const char* name; void* data; size_t size; } SymData;
-
-/* __progname / __progname_full / program_invocation_name — used by uptime, coreutils */
-static char* g_progname = (char*)"mine";
-static char* g_progname_full = (char*)"mine";
-static char* g_program_invocation_name = (char*)"mine";
-static char* g_program_invocation_short_name = (char*)"mine";
 
 #define SYM_DATA_COUNT 14
 static SymData s_data[SYM_DATA_COUNT];
@@ -3108,12 +3610,15 @@ bool MineDynLink(const char* path, MineImage* img)
     mine_tls_init_dtv();
     g_envp = (char**)_environ;
 
-    /* Set __progname to the binary filename (basename of path) */
+    /* Set __progname / program_invocation_name to the binary filename */
     {
         const char* base = path;
         for (const char* p = path; *p; p++)
             if (*p == '/' || *p == '\\') base = p + 1;
-        g_progname = g_progname_full = (char*)base;
+        g_progname = (char*)base;
+        g_progname_full = (char*)path;
+        g_program_invocation_name = (char*)path;
+        g_program_invocation_short_name = (char*)base;
     }
 
     MineThunkInit();

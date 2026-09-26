@@ -56,8 +56,8 @@ void MineTraceEnter(uint64_t nr,
 {
     if (!g_trace_enabled) return;
     
-    fprintf(stderr, "[sys] %-18s (%llx %llx %llx %llx %llx %llx) --> ",
-        nr_name(nr),
+    fprintf(stderr, "[sys] %-18s [%3llu] (%llx %llx %llx %llx %llx %llx) --> ",
+        nr_name(nr), (unsigned long long)nr,
         (unsigned long long)a1, (unsigned long long)a2,
         (unsigned long long)a3, (unsigned long long)a4,
         (unsigned long long)a5, (unsigned long long)a6);

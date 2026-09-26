@@ -65,6 +65,10 @@ extern "C" {
 #define VFS_PROC_SYS        22
 #define VFS_DEV_TTY         30
 #define VFS_DEV_PTMX        31
+#define VFS_PROC_MOUNTS     23
+#define VFS_ETC_PASSWD      40
+#define VFS_ETC_GROUP       41
+#define VFS_ETC_NSSWITCH    42
 #define VFS_UNKNOWN         99
 
     const char* MineVFSTranslate(const char* linux_path, int* virt_type);
@@ -82,6 +86,7 @@ extern "C" {
     int     MineVFSClose(int vfd);
     bool    MineVFSIsVFD(int fd);
     int64_t MineVFSFstat(int vfd, void* stat_buf);
+    int64_t MineVFSLseek(int vfd, int64_t offset, int whence);
 
     /* Generate readlink content for /proc/self/exe */
     int64_t MineVFSReadlink(int virt_type, char* buf, uint64_t bufsiz);

@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <wincrypt.h>
 #include <ctype.h>
+#include "mine_dynamic.h"
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -95,25 +96,18 @@ static const char* translate_linux_to_win(const char* path)
         }
     }
 
-    /* /etc -> just try current directory\etc or skip */
+    /* /etc -> translate known real files */
     if (strncmp(path, "/etc/", 5) == 0) {
-        /* Most /etc files don't exist on Windows; some we can fake */
-        if (strcmp(path, "/etc/hostname") == 0 ||
-            strcmp(path, "/etc/resolv.conf") == 0 ||
-            strcmp(path, "/etc/hosts") == 0) {
-            /* Windows hosts file */
-            if (strcmp(path, "/etc/hosts") == 0) {
-                snprintf(g_translate_buf, sizeof(g_translate_buf),
-                    "C:\\Windows\\System32\\drivers\\etc\\hosts");
-                return g_translate_buf;
-            }
-            if (strcmp(path, "/etc/resolv.conf") == 0) {
-                snprintf(g_translate_buf, sizeof(g_translate_buf),
-                    "C:\\Windows\\System32\\drivers\\etc\\resolv.conf");
-                return g_translate_buf;
-            }
+        if (strcmp(path, "/etc/hosts") == 0) {
+            snprintf(g_translate_buf, sizeof(g_translate_buf),
+                "C:\\Windows\\System32\\drivers\\etc\\hosts");
+            return g_translate_buf;
         }
-        /* Return path as-is (will fail gracefully) */
+        if (strcmp(path, "/etc/resolv.conf") == 0) {
+            snprintf(g_translate_buf, sizeof(g_translate_buf),
+                "C:\\Windows\\System32\\drivers\\etc\\resolv.conf");
+            return g_translate_buf;
+        }
     }
 
     /* /var/tmp -> %TEMP% */
@@ -176,6 +170,9 @@ static int classify_proc_path(const char* path)
     if (strcmp(path, "/proc/loadavg") == 0)      return VFS_PROC_LOADAVG;
     if (strcmp(path, "/proc/version") == 0)      return VFS_PROC_VERSION;
     if (strncmp(path, "/proc/sys/", 10) == 0)   return VFS_PROC_SYS;
+    if (strcmp(path, "/proc/mounts") == 0)      return VFS_PROC_MOUNTS;
+    if (strcmp(path, "/proc/self/mounts") == 0) return VFS_PROC_MOUNTS;
+    if (strcmp(path, "/proc/self/mountinfo") == 0) return VFS_PROC_MOUNTS;
 
     /* Any other /proc path */
     if (strncmp(path, "/proc/", 6) == 0) return VFS_UNKNOWN;
@@ -228,6 +225,13 @@ const char* MineVFSTranslate(const char* linux_path, int* virt_type)
     if (strncmp(linux_path, "/dev", 4) == 0) {
         *virt_type = classify_dev_path(linux_path);
         if (*virt_type != VFS_REAL) return NULL;
+    }
+
+    /* Check /etc virtual files */
+    if (strncmp(linux_path, "/etc/", 5) == 0) {
+        if (strcmp(linux_path, "/etc/passwd") == 0) { *virt_type = VFS_ETC_PASSWD; return NULL; }
+        if (strcmp(linux_path, "/etc/group") == 0)  { *virt_type = VFS_ETC_GROUP;  return NULL; }
+        if (strcmp(linux_path, "/etc/nsswitch.conf") == 0) { *virt_type = VFS_ETC_NSSWITCH; return NULL; }
     }
 
     /* Real file — translate path */
@@ -362,6 +366,23 @@ static char* gen_proc_self_stat(void)
 
 static char* gen_proc_self_cmdline(void)
 {
+    int argc = MineGetGuestArgc();
+    char** argv = MineGetGuestArgv();
+    if (argc > 0 && argv) {
+        size_t total = 0;
+        for (int i = 0; i < argc; i++)
+            total += strlen(argv[i]) + 1;
+        char* buf = (char*)malloc(total + 1);
+        if (!buf) return NULL;
+        size_t pos = 0;
+        for (int i = 0; i < argc; i++) {
+            size_t slen = strlen(argv[i]);
+            memcpy(buf + pos, argv[i], slen);
+            pos += slen;
+            buf[pos++] = '\0';
+        }
+        return buf;
+    }
     size_t len = strlen(g_elf_path_linux) + 1;
     char* buf = (char*)malloc(len + 1);
     if (!buf) return NULL;
@@ -499,6 +520,58 @@ static char* gen_proc_sys(const char* path)
     return _strdup("0\n");
 }
 
+static char* gen_proc_mounts(void)
+{
+    char cwd[MAX_PATH];
+    GetCurrentDirectoryA(sizeof(cwd), cwd);
+    char drive_root[4] = "C:\\";
+    if (cwd[0] && cwd[1] == ':') drive_root[0] = cwd[0];
+
+    ULARGE_INTEGER total = {0};
+    GetDiskFreeSpaceExA(drive_root, NULL, &total, NULL);
+
+    char* buf = (char*)malloc(1024);
+    if (!buf) return _strdup("/dev/sda1 / ext4 rw,relatime 0 0\n");
+    int n = 0;
+    n += sprintf(buf + n, "/dev/sda1 / ext4 rw,relatime 0 0\n");
+    n += sprintf(buf + n, "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n");
+    n += sprintf(buf + n, "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n");
+    n += sprintf(buf + n, "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n");
+    n += sprintf(buf + n, "devtmpfs /dev devtmpfs rw,nosuid 0 0\n");
+    (void)n;
+    return buf;
+}
+
+static char* gen_etc_passwd(void)
+{
+    char name[256];
+    DWORD sz = sizeof(name);
+    if (!GetUserNameA(name, &sz)) strcpy(name, "user");
+    char* buf = (char*)malloc(512);
+    if (!buf) return _strdup("root:x:0:0:root:/root:/bin/bash\n");
+    sprintf(buf, "root:x:0:0:root:/root:/bin/bash\n"
+                 "%s:x:1000:1000:%s:/home/%s:/bin/bash\n"
+                 "nobody:x:65534:65534:Nobody:/:/usr/bin/nologin\n",
+                 name, name, name);
+    return buf;
+}
+
+static char* gen_etc_group(void)
+{
+    char name[256];
+    DWORD sz = sizeof(name);
+    if (!GetUserNameA(name, &sz)) strcpy(name, "user");
+    char* buf = (char*)malloc(512);
+    if (!buf) return _strdup("root:x:0:\n");
+    sprintf(buf, "root:x:0:\n%s:x:1000:\nnogroup:x:65534:\n", name);
+    return buf;
+}
+
+static char* gen_etc_nsswitch(void)
+{
+    return _strdup("passwd: files\ngroup: files\nhosts: files dns\n");
+}
+
 /* ─── Open virtual files ─────────────────────────────────────────────────── */
 
 int MineVFSOpen(int virt_type, int flags)
@@ -556,6 +629,10 @@ int MineVFSOpen(int virt_type, int flags)
     case VFS_PROC_LOADAVG:      content = gen_proc_loadavg();     break;
     case VFS_PROC_VERSION:      content = gen_proc_version();     break;
     case VFS_PROC_SYS:          content = gen_proc_sys("");        break;
+    case VFS_PROC_MOUNTS:       content = gen_proc_mounts();      break;
+    case VFS_ETC_PASSWD:        content = gen_etc_passwd();       break;
+    case VFS_ETC_GROUP:         content = gen_etc_group();        break;
+    case VFS_ETC_NSSWITCH:      content = gen_etc_nsswitch();     break;
     default:
         /* Unknown proc file — return empty */
         content = _strdup("");
@@ -664,6 +741,24 @@ int64_t MineVFSFstat(int vfd, void* stat_buf)
     memcpy((uint8_t*)stat_buf + 56, &blksz, 8);
 
     return 0;
+}
+
+int64_t MineVFSLseek(int vfd, int64_t offset, int whence)
+{
+    VFD* v = get_vfd(vfd);
+    if (!v) return -9; /* EBADF */
+    if (!v->content) return -29; /* ESPIPE — can't seek /dev/zero etc */
+
+    int64_t newpos;
+    switch (whence) {
+    case 0: newpos = offset; break;                              /* SEEK_SET */
+    case 1: newpos = (int64_t)v->read_pos + offset; break;      /* SEEK_CUR */
+    case 2: newpos = (int64_t)v->content_len + offset; break;   /* SEEK_END */
+    default: return -22; /* EINVAL */
+    }
+    if (newpos < 0) return -22;
+    v->read_pos = (size_t)newpos;
+    return newpos;
 }
 
 /* ─── readlink ───────────────────────────────────────────────────────────── */
